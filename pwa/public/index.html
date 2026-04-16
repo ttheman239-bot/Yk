@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="theme-color" content="#0d1117">
+<link rel="manifest" href="/manifest.json">
+<title>News Impact Analysis</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+:root{--bg:#0d1117;--bg2:#161b22;--bg3:#1c2128;--bdr:#30363d;--t1:#e6edf3;--t2:#8b949e;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--orange:#d29922;--purple:#bc8cff}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--t1);line-height:1.5}
+.nav{background:var(--bg2);border-bottom:1px solid var(--bdr);padding:8px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:8px}
+.nav h1{font-size:1.1rem;white-space:nowrap}.nav h1 span{color:var(--blue)}
+.ctrls{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.ctrls select,.ctrls button{background:var(--bg3);color:var(--t1);border:1px solid var(--bdr);padding:6px 10px;border-radius:6px;font-size:.8rem;cursor:pointer}
+.ctrls button{background:var(--blue);color:#fff;border:none;font-weight:600}
+.ctrls button:disabled{opacity:.4}
+.ctrls button.g{background:var(--green)}.ctrls button.p{background:var(--purple)}
+.wrap{max-width:1400px;margin:0 auto;padding:12px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
+.sc{background:var(--bg3);border:1px solid var(--bdr);border-radius:8px;padding:10px 14px}
+.sc .l{font-size:.7rem;color:var(--t2);text-transform:uppercase;letter-spacing:.5px}
+.sc .v{font-size:1.6rem;font-weight:700;margin-top:2px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--bdr);margin-bottom:12px}
+.tab{padding:8px 16px;cursor:pointer;border-bottom:2px solid transparent;color:var(--t2);font-size:.85rem}
+.tab:hover{color:var(--t1)}.tab.on{color:var(--blue);border-bottom-color:var(--blue)}
+.tp{display:none}.tp.on{display:block}
+.card{background:var(--bg3);border:1px solid var(--bdr);border-radius:8px;padding:14px;margin-bottom:12px}
+.card h3{font-size:.9rem;color:var(--t2);margin-bottom:8px}
+.chart-box{width:100%;min-height:350px}
+.msel{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.mb{padding:5px 12px;background:var(--bg2);border:1px solid var(--bdr);border-radius:6px;color:var(--t2);cursor:pointer;font-size:.8rem}
+.mb:hover,.mb.on{background:var(--blue);color:#fff;border-color:var(--blue)}
+.ni{padding:10px 14px;border-bottom:1px solid var(--bdr)}
+.ni .ti{font-weight:500;margin-bottom:3px}.ni .me{display:flex;gap:8px;font-size:.75rem;color:var(--t2);flex-wrap:wrap}
+.badge{display:inline-block;padding:1px 6px;border-radius:10px;font-size:.7rem;background:rgba(88,166,255,.1);color:var(--blue)}
+.pos{color:var(--green)}.neg{color:var(--red)}
+.tbl{width:100%;border-collapse:collapse;font-size:.8rem}
+.tbl th,.tbl td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--bdr)}
+.tbl th{color:var(--t2);font-size:.7rem;text-transform:uppercase}
+.cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.ccard{background:var(--bg2);border:1px solid var(--bdr);border-radius:8px;padding:12px}
+.ccard h4{color:var(--blue);margin-bottom:6px;font-size:.9rem}
+.ccard .m{display:flex;justify-content:space-between;padding:3px 0;font-size:.8rem}
+.ccard .m .k{color:var(--t2)}
+.loading{text-align:center;padding:30px;color:var(--t2)}
+.msg{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--bdr);padding:8px 20px;border-radius:8px;font-size:.85rem;z-index:200;display:none}
+@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<nav class="nav">
+<h1><span>News Impact</span> Analysis</h1>
+<div class="ctrls">
+<select id="days"><option value="30">30d</option><option value="60">60d</option><option value="90" selected>90d</option><option value="180">180d</option><option value="365">1y</option></select>
+<button onclick="doFetchNews(this)">Fetch News</button>
+<button class="g" onclick="doFetchMarkets(this)">Fetch Markets</button>
+<button class="p" onclick="doAnalyze(this)">Analyze</button>
+</div>
+</nav>
+<div class="wrap">
+<div class="stats">
+<div class="sc"><div class="l">News</div><div class="v" id="sn" style="color:var(--blue)">0</div></div>
+<div class="sc"><div class="l">Markets</div><div class="v" id="sm" style="color:var(--green)">0</div></div>
+<div class="sc"><div class="l">Trading Days</div><div class="v" id="sd" style="color:var(--orange)">0</div></div>
+<div class="sc"><div class="l">Analyses</div><div class="v" id="sa" style="color:var(--purple)">0</div></div>
+</div>
+<div class="tabs">
+<div class="tab on" onclick="switchTab(0)">Overview</div>
+<div class="tab" onclick="switchTab(1)">Markets</div>
+<div class="tab" onclick="switchTab(2)">Categories</div>
+<div class="tab" onclick="switchTab(3)">News</div>
+</div>
+<div id="t0" class="tp on"><div id="overview"><div class="loading">Fetch data then click Analyze</div></div></div>
+<div id="t1" class="tp">
+<div class="msel" id="msel"></div>
+<div id="mdetail"><div class="loading">Run analysis first</div></div>
+</div>
+<div id="t2" class="tp"><div id="catreport"><div class="loading">Run analysis first</div></div></div>
+<div id="t3" class="tp"><div id="newsfeed"><div class="loading">Fetch news first</div></div></div>
+</div>
+<div class="msg" id="msg"></div>
+
+<script>
+let AD=null,CM="NIKKEI";
+const CAT_LABELS={fed_policy:"Fed / Monetary Policy",inflation:"Inflation / CPI",employment:"Employment / Jobs",earnings:"Corporate Earnings",trade_war:"Trade / Tariffs",geopolitical:"Geopolitical Events",tech_sector:"Tech Sector",energy:"Energy / Oil",banking_crisis:"Banking Crisis",gdp_economic:"GDP / Economic Data",crypto:"Cryptocurrency",regulation:"Regulation / Policy",other:"Other"};
+const MKT_NAMES={NIKKEI:"Nikkei 225",HSI:"Hang Seng",SSE:"Shanghai Composite",KOSPI:"KOSPI",ASX:"ASX 200",SP500:"S&P 500",FTSE:"FTSE 100",DAX:"DAX"};
+const TARGETS=["NIKKEI","HSI","SSE","KOSPI","ASX"];
+
+window.onload=()=>{loadStats();buildMsel();if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js")};
+
+function switchTab(i){document.querySelectorAll(".tab").forEach((t,j)=>{t.classList.toggle("on",j===i)});document.querySelectorAll(".tp").forEach((t,j)=>{t.classList.toggle("on",j===i)})}
+
+function showMsg(t){const m=document.getElementById("msg");m.textContent=t;m.style.display="block";setTimeout(()=>m.style.display="none",3000)}
+
+async function loadStats(){
+  try{const r=await(await fetch("/api/stats")).json();
+  document.getElementById("sn").textContent=r.newsCount;document.getElementById("sm").textContent=r.marketCount;
+  document.getElementById("sd").textContent=r.tradingDays;document.getElementById("sa").textContent=r.analysisCount;
+  renderNews(r.latestNews)}catch(e){console.error(e)}
+}
+
+async function doFetchNews(btn){btn.disabled=true;btn.textContent="...";try{const r=await(await fetch("/api/fetch_news",{method:"POST"})).json();showMsg(`Fetched ${r.fetched}, stored ${r.stored} new`);loadStats()}catch(e){showMsg("Error: "+e.message)}btn.disabled=false;btn.textContent="Fetch News"}
+async function doFetchMarkets(btn){btn.disabled=true;btn.textContent="...";try{const r=await(await fetch("/api/fetch_markets",{method:"POST"})).json();showMsg(`${r.marketsUpdated} markets, ${r.totalRecords} records`);loadStats()}catch(e){showMsg("Error: "+e.message)}btn.disabled=false;btn.textContent="Fetch Markets"}
+async function doAnalyze(btn){btn.disabled=true;btn.textContent="...";try{const d=document.getElementById("days").value;AD=await(await fetch(`/api/analyze?days=${d}`,{method:"POST"})).json();showMsg(`Analyzed ${Object.keys(AD.marketResults).length} markets`);renderOverview();renderMarket();renderCategories();loadStats()}catch(e){showMsg("Error: "+e.message)}btn.disabled=false;btn.textContent="Analyze"}
+
+function buildMsel(){const c=document.getElementById("msel");TARGETS.forEach(k=>{const b=document.createElement("div");b.className="mb"+(k===CM?" on":"");b.textContent=MKT_NAMES[k]||k;b.onclick=()=>{CM=k;c.querySelectorAll(".mb").forEach(x=>x.classList.remove("on"));b.classList.add("on");renderMarket()};c.appendChild(b)})}
+
+function renderOverview(){
+  if(!AD||!AD.marketResults)return;const el=document.getElementById("overview");el.innerHTML="";
+  // Heatmap
+  const mks=Object.keys(AD.marketResults),cats=new Set();mks.forEach(m=>{Object.keys(AD.marketResults[m].categoryImpacts||{}).forEach(c=>cats.add(c))});
+  const catArr=[...cats].sort(),z=[],txt=[];
+  catArr.forEach(c=>{const row=[],tr=[];mks.forEach(m=>{const v=AD.marketResults[m]?.categoryImpacts?.[c]?.correlation||0;row.push(v);tr.push(v.toFixed(3))});z.push(row);txt.push(tr)});
+  if(z.length){const d1=document.createElement("div");d1.className="card";d1.innerHTML="<h3>Correlation Heatmap: S&P 500 → Target Markets</h3><div id='ch1' class='chart-box'></div>";el.appendChild(d1);
+  Plotly.newPlot("ch1",[{type:"heatmap",z,x:mks.map(m=>MKT_NAMES[m]||m),y:catArr.map(c=>CAT_LABELS[c]||c),colorscale:"RdBu",zmid:0,zmin:-1,zmax:1,text:txt,texttemplate:"%{text}",colorbar:{title:"Corr"}}],{paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"#0d1117",font:{color:"#e6edf3",size:10},margin:{l:140,r:20,t:30,b:40},height:Math.max(350,catArr.length*35+100)},{responsive:true,displayModeBar:false})}
+
+  // Spillover bars
+  if(AD.categoryReport){const entries=Object.values(AD.categoryReport).filter(c=>c.avgSpillover!=null).sort((a,b)=>b.avgSpillover-a.avgSpillover);
+  if(entries.length){const d2=document.createElement("div");d2.className="card";d2.innerHTML="<h3>Avg Spillover Ratio by News Category</h3><div id='ch2' class='chart-box'></div>";el.appendChild(d2);
+  Plotly.newPlot("ch2",[{type:"bar",x:entries.map(e=>e.label),y:entries.map(e=>e.avgSpillover),marker:{color:entries.map(e=>e.avgSpillover>0?"#f85149":"#58a6ff")}}],{paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"#0d1117",font:{color:"#e6edf3",size:10},margin:{l:50,r:20,t:20,b:80},height:400,xaxis:{tickangle:-45},yaxis:{title:"Spillover Ratio"}},{responsive:true,displayModeBar:false})}}
+
+  // Correlation table
+  const tbl=document.createElement("div");tbl.className="card";let th="<h3>Spillover Correlation Summary</h3><table class='tbl'><tr><th>Market</th><th>Corr</th><th>Gap Corr</th><th>N</th><th>Sig?</th></tr>";
+  mks.forEach(m=>{const r=AD.marketResults[m];const bc=r.basicCorrelation,gc=r.gapCorrelation;
+  th+=`<tr><td>${r.targetName}</td><td style="color:${bc?.significant?'var(--purple)':'var(--t2)'}">${bc?bc.correlation.toFixed(4):'N/A'}</td><td>${gc?gc.correlation.toFixed(4):'N/A'}</td><td>${bc?bc.n:'-'}</td><td class="${bc?.significant?'pos':'neg'}">${bc?(bc.significant?'Yes':'No'):'-'}</td></tr>`});
+  th+="</table>";tbl.innerHTML=th;el.appendChild(tbl);
+}
+
+function renderMarket(){
+  if(!AD)return;const el=document.getElementById("mdetail");el.innerHTML="";
+  const r=AD.marketResults[CM];if(!r){el.innerHTML="<div class='loading'>No data for this market</div>";return}
+  const pairs=r.eventPairs?.filter(p=>p.targetReturn!=null)||[];
+  if(!pairs.length){el.innerHTML="<div class='loading'>No event pairs</div>";return}
+
+  // Scatter
+  const d1=document.createElement("div");d1.className="card";d1.innerHTML=`<h3>S&P 500 → ${r.targetName} Scatter</h3><div id='chS' class='chart-box'></div>`;el.appendChild(d1);
+  const byCat={};pairs.forEach(p=>{(byCat[p.newsCategory]=byCat[p.newsCategory]||[]).push(p)});
+  const traces=Object.entries(byCat).map(([c,ps])=>({type:"scatter",mode:"markers",name:CAT_LABELS[c]||c,x:ps.map(p=>p.spReturn),y:ps.map(p=>p.targetReturn),marker:{size:6,opacity:.7}}));
+  Plotly.newPlot("chS",traces,{paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"#0d1117",font:{color:"#e6edf3",size:10},margin:{l:50,r:20,t:20,b:50},height:400,xaxis:{title:"S&P 500 Return"},yaxis:{title:r.targetName+" Return"}},{responsive:true,displayModeBar:false});
+
+  // Timeline
+  const sorted=pairs.sort((a,b)=>a.spDate.localeCompare(b.spDate));
+  const d2=document.createElement("div");d2.className="card";d2.innerHTML=`<h3>Return Timeline</h3><div id='chT' class='chart-box'></div>`;el.appendChild(d2);
+  Plotly.newPlot("chT",[{type:"bar",name:"S&P 500 %",x:sorted.map(p=>p.spDate),y:sorted.map(p=>p.spReturn*100),marker:{color:"rgba(99,110,250,0.6)"}},{type:"scatter",mode:"lines",name:r.targetName+" %",x:sorted.map(p=>p.spDate),y:sorted.map(p=>p.targetReturn*100),yaxis:"y2",line:{color:"#ffa500"}}],{paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"#0d1117",font:{color:"#e6edf3",size:10},margin:{l:50,r:50,t:20,b:50},height:380,yaxis:{title:"S&P 500 %"},yaxis2:{title:r.targetName+" %",overlaying:"y",side:"right"},legend:{x:0,y:1.1,orientation:"h"}},{responsive:true,displayModeBar:false});
+
+  // Category impacts
+  const imps=Object.values(r.categoryImpacts||{}).sort((a,b)=>Math.abs(b.correlation)-Math.abs(a.correlation));
+  if(imps.length){const d3=document.createElement("div");d3.className="card";d3.innerHTML="<h3>Category Impact Breakdown</h3>";
+  const t=document.createElement("table");t.className="tbl";t.innerHTML="<tr><th>Category</th><th>Corr</th><th>Avg S&P%</th><th>Avg Target%</th><th>Spillover</th><th>N</th></tr>"+imps.map(i=>`<tr><td>${i.label}</td><td style="color:${i.significant?'var(--purple)':'var(--t2)'}">${i.correlation.toFixed(4)}</td><td>${i.avgSp500Return.toFixed(3)}</td><td>${i.avgTargetReturn.toFixed(3)}</td><td>${i.spilloverRatio!=null?i.spilloverRatio.toFixed(3):'N/A'}</td><td>${i.eventCount}</td></tr>`).join("");
+  d3.appendChild(t);el.appendChild(d3)}
+}
+
+function renderCategories(){
+  if(!AD?.categoryReport)return;const el=document.getElementById("catreport");el.innerHTML="<h3 style='margin-bottom:12px'>News Category Spillover Impact</h3>";
+  const grid=document.createElement("div");grid.className="cgrid";
+  Object.values(AD.categoryReport).sort((a,b)=>Math.abs(b.avgSpillover||0)-Math.abs(a.avgSpillover||0)).forEach(c=>{
+    const sc=c.avgSpillover!=null?(c.avgSpillover>0?"var(--red)":"var(--green)"):"var(--t2)";
+    const card=document.createElement("div");card.className="ccard";
+    card.innerHTML=`<h4>${c.label}</h4><div class="m"><span class="k">Events</span><span>${c.totalEvents}</span></div><div class="m"><span class="k">Avg Spillover</span><span style="color:${sc}">${c.avgSpillover!=null?c.avgSpillover.toFixed(3):'N/A'}</span></div><div class="m"><span class="k">Significant</span><span>${c.significantMarkets}/${c.totalMarkets}</span></div>`;
+    grid.appendChild(card)});
+  el.appendChild(grid);
+}
+
+function renderNews(news){
+  const el=document.getElementById("newsfeed");el.innerHTML="";
+  if(!news||!news.length){el.innerHTML="<div class='loading'>No news. Click Fetch News.</div>";return}
+  news.forEach(a=>{const d=document.createElement("div");d.className="ni";
+  const sc=a.sentiment_score;const scC=sc>0?"pos":sc<0?"neg":"";
+  d.innerHTML=`<div class="ti">${esc(a.title)}</div><div class="me"><span>${a.source||""}</span>${a.category?`<span class="badge">${CAT_LABELS[a.category]||a.category}</span>`:""}<span class="${scC}">${sc!=null?(sc>0?"+":"")+sc.toFixed(2):""}</span><span>${(a.published_at||"").slice(0,10)}</span></div>`;
+  el.appendChild(d)});
+}
+
+function esc(t){if(!t)return"";const d=document.createElement("div");d.textContent=t;return d.innerHTML}
+</script>
+</body>
+</html>

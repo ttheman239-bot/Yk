@@ -1,0 +1,17 @@
+{
+  "name": "news-impact-analysis",
+  "version": "1.0.0",
+  "description": "S&P 500 news spillover analysis - standalone PWA",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": ["finance","news","s&p500","spillover"],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "express": "^5.2.1",
+    "xml2js": "^0.6.2"
+  }
+}
