@@ -61,11 +61,16 @@ async function fetchYahoo(symbol) {
   return rows;
 }
 
+let STOOQ_SAMPLE_SAVED = false;
 async function fetchStooq(symbol) {
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`;
-  const r = await fetch(url, { headers: { "User-Agent": UA } });
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d&e=csv`;
+  const r = await fetch(url, { headers: { "User-Agent": UA, "Accept": "text/csv,text/plain,*/*" } });
   if (!r.ok) throw new Error(`Stooq HTTP ${r.status}`);
   const text = await r.text();
+  if (!STOOQ_SAMPLE_SAVED) {
+    try { fs.writeFileSync(path.join(DATA_DIR, "stooq-sample.txt"), `URL: ${url}\nSTATUS: ${r.status}\nCT: ${r.headers.get("content-type")}\n---\n${text.slice(0, 800)}`); } catch (_) {}
+    STOOQ_SAMPLE_SAVED = true;
+  }
   if (!text || text.toLowerCase().includes("no data") || text.length < 80) throw new Error("Stooq: empty/no-data");
   const lines = text.trim().split(/\r?\n/);
   const header = lines[0].toLowerCase().split(",");
