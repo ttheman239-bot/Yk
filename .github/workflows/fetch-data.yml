@@ -31,6 +31,8 @@ jobs:
           node-version: '20'
 
       - name: Fetch data
+        env:
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
         run: node scripts/fetch-data.js
 
       - name: Commit updated data

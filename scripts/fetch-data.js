@@ -1,94 +1,110 @@
 #!/usr/bin/env node
-/* Fetch daily OHLC for a curated symbol list from Yahoo Finance, falling back to Stooq.
-   Writes one JSON per symbol into /data plus a manifest.json. */
+/* Fetch daily OHLC for a curated symbol list.
+   Strategy: try Yahoo Finance direct, then via several CORS/HTTP proxies,
+   then Twelve Data (needs TWELVEDATA_KEY env var). Writes one JSON per symbol
+   into /data plus manifest.json and debug.log. */
 
 const fs = require("fs");
 const path = require("path");
 
 const DATA_DIR = path.resolve(__dirname, "..", "data");
 const YEARS_BACK = 7;
-
-// yahoo = Yahoo Finance symbol, stooq = Stooq fallback
-const SYMBOLS = [
-  { id: "^spx",   name: "S&P 500",         tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^GSPC",    stooq: "^spx"   },
-  { id: "^ndx",   name: "Nasdaq 100",      tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^NDX",     stooq: "^ndx"   },
-  { id: "^dji",   name: "Dow Jones",       tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^DJI",     stooq: "^dji"   },
-  { id: "^vix",   name: "VIX",             tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^VIX",     stooq: "^vix"   },
-
-  { id: "wti",    name: "WTI Crude",       tz: "America/New_York",   region: "Macro",  role: "leader",   yahoo: "CL=F",     stooq: "cl.f"   },
-  { id: "gold",   name: "Gold",            tz: "America/New_York",   region: "Macro",  role: "leader",   yahoo: "GC=F",     stooq: "gc.f"   },
-  { id: "dxy",    name: "Dollar Index",    tz: "America/New_York",   region: "Macro",  role: "leader",   yahoo: "DX-Y.NYB", stooq: "^dxy"   },
-  { id: "btc",    name: "Bitcoin",         tz: "UTC",                region: "Macro",  role: "leader",   yahoo: "BTC-USD",  stooq: "btcusd" },
-
-  { id: "^dax",   name: "DAX",             tz: "Europe/Berlin",      region: "Europe", role: "both",     yahoo: "^GDAXI",   stooq: "^dax"   },
-  { id: "^ftm",   name: "FTSE 100",        tz: "Europe/London",      region: "Europe", role: "both",     yahoo: "^FTSE",    stooq: "^ftm"   },
-
-  { id: "^set",   name: "SET (Thailand)",  tz: "Asia/Bangkok",       region: "Asia",   role: "follower", yahoo: "^SET.BK",  stooq: "^set"   },
-  { id: "^nkx",   name: "Nikkei 225",      tz: "Asia/Tokyo",         region: "Asia",   role: "follower", yahoo: "^N225",    stooq: "^nkx"   },
-  { id: "^hsi",   name: "Hang Seng",       tz: "Asia/Hong_Kong",     region: "Asia",   role: "follower", yahoo: "^HSI",     stooq: "^hsi"   },
-  { id: "^kospi", name: "KOSPI",           tz: "Asia/Seoul",         region: "Asia",   role: "follower", yahoo: "^KS11",    stooq: "^kospi" },
-  { id: "^sti",   name: "STI (Singapore)", tz: "Asia/Singapore",     region: "Asia",   role: "follower", yahoo: "^STI",     stooq: "^sti"   },
-  { id: "^twse",  name: "TWSE (Taiwan)",   tz: "Asia/Taipei",        region: "Asia",   role: "follower", yahoo: "^TWII",    stooq: "^twse"  },
-  { id: "^shc",   name: "Shanghai Comp.",  tz: "Asia/Shanghai",      region: "Asia",   role: "follower", yahoo: "000001.SS",stooq: "^shc"   },
-  { id: "^axjo",  name: "ASX 200",         tz: "Australia/Sydney",   region: "Asia",   role: "follower", yahoo: "^AXJO",    stooq: "^axjo"  },
-  { id: "^nsei",  name: "Nifty 50",        tz: "Asia/Kolkata",       region: "Asia",   role: "follower", yahoo: "^NSEI",    stooq: "^nsei"  },
-];
-
+const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || "";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
+
+const SYMBOLS = [
+  { id: "^spx",   name: "S&P 500",         tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^GSPC",    td: "SPX"      },
+  { id: "^ndx",   name: "Nasdaq 100",      tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^NDX",     td: "NDX"      },
+  { id: "^dji",   name: "Dow Jones",       tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^DJI",     td: "DJI"      },
+  { id: "^vix",   name: "VIX",             tz: "America/New_York",   region: "US",     role: "leader",   yahoo: "^VIX",     td: "VIX"      },
+  { id: "wti",    name: "WTI Crude",       tz: "America/New_York",   region: "Macro",  role: "leader",   yahoo: "CL=F",     td: "WTI/USD"  },
+  { id: "gold",   name: "Gold",            tz: "America/New_York",   region: "Macro",  role: "leader",   yahoo: "GC=F",     td: "XAU/USD"  },
+  { id: "dxy",    name: "Dollar Index",    tz: "America/New_York",   region: "Macro",  role: "leader",   yahoo: "DX-Y.NYB", td: "DXY"      },
+  { id: "btc",    name: "Bitcoin",         tz: "UTC",                region: "Macro",  role: "leader",   yahoo: "BTC-USD",  td: "BTC/USD"  },
+  { id: "^dax",   name: "DAX",             tz: "Europe/Berlin",      region: "Europe", role: "both",     yahoo: "^GDAXI",   td: "DAX"      },
+  { id: "^ftm",   name: "FTSE 100",        tz: "Europe/London",      region: "Europe", role: "both",     yahoo: "^FTSE",    td: "UKX"      },
+  { id: "^set",   name: "SET (Thailand)",  tz: "Asia/Bangkok",       region: "Asia",   role: "follower", yahoo: "^SET.BK",  td: "SET"      },
+  { id: "^nkx",   name: "Nikkei 225",      tz: "Asia/Tokyo",         region: "Asia",   role: "follower", yahoo: "^N225",    td: "N225"     },
+  { id: "^hsi",   name: "Hang Seng",       tz: "Asia/Hong_Kong",     region: "Asia",   role: "follower", yahoo: "^HSI",     td: "HSI"      },
+  { id: "^kospi", name: "KOSPI",           tz: "Asia/Seoul",         region: "Asia",   role: "follower", yahoo: "^KS11",    td: "KS11"     },
+  { id: "^sti",   name: "STI (Singapore)", tz: "Asia/Singapore",     region: "Asia",   role: "follower", yahoo: "^STI",     td: "STI"      },
+  { id: "^twse",  name: "TWSE (Taiwan)",   tz: "Asia/Taipei",        region: "Asia",   role: "follower", yahoo: "^TWII",    td: "TWII"     },
+  { id: "^shc",   name: "Shanghai Comp.",  tz: "Asia/Shanghai",      region: "Asia",   role: "follower", yahoo: "000001.SS",td: "SHCOMP"   },
+  { id: "^axjo",  name: "ASX 200",         tz: "Australia/Sydney",   region: "Asia",   role: "follower", yahoo: "^AXJO",    td: "AXJO"     },
+  { id: "^nsei",  name: "Nifty 50",        tz: "Asia/Kolkata",       region: "Asia",   role: "follower", yahoo: "^NSEI",    td: "NIFTY"    },
+];
 
 function safeName(id) { return id.replace(/[^a-z0-9]+/gi, "_").toLowerCase(); }
 
-async function fetchYahoo(symbol) {
+function yahooChartUrl(symbol) {
   const now = Math.floor(Date.now() / 1000);
   const start = now - YEARS_BACK * 365 * 86400;
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${start}&period2=${now}&interval=1d&events=history`;
-  const r = await fetch(url, { headers: { "User-Agent": UA, "Accept": "application/json" } });
-  if (!r.ok) throw new Error(`Yahoo HTTP ${r.status}`);
-  const j = await r.json();
+  return `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${start}&period2=${now}&interval=1d&events=history`;
+}
+
+function parseYahooJson(j) {
   const result = j?.chart?.result?.[0];
-  if (!result) throw new Error("Yahoo: no chart result");
+  if (!result) throw new Error("no chart result");
   const ts = result.timestamp || [];
   const q = result.indicators?.quote?.[0] || {};
   const rows = [];
   for (let i = 0; i < ts.length; i++) {
-    const t = ts[i];
     const o = q.open?.[i], h = q.high?.[i], l = q.low?.[i], c = q.close?.[i];
     if (!(o > 0 && h > 0 && l > 0 && c > 0)) continue;
-    const d = new Date(t * 1000).toISOString().slice(0, 10);
+    const d = new Date(ts[i] * 1000).toISOString().slice(0, 10);
     rows.push({ d, o: +o.toFixed(4), h: +h.toFixed(4), l: +l.toFixed(4), c: +c.toFixed(4) });
   }
-  if (rows.length < 50) throw new Error(`Yahoo: only ${rows.length} rows`);
+  if (rows.length < 50) throw new Error(`only ${rows.length} rows`);
   return rows;
 }
 
-let STOOQ_SAMPLE_SAVED = false;
-async function fetchStooq(symbol) {
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d&e=csv`;
-  const r = await fetch(url, { headers: { "User-Agent": UA, "Accept": "text/csv,text/plain,*/*" } });
-  if (!r.ok) throw new Error(`Stooq HTTP ${r.status}`);
-  const text = await r.text();
-  if (!STOOQ_SAMPLE_SAVED) {
-    try { fs.writeFileSync(path.join(DATA_DIR, "stooq-sample.txt"), `URL: ${url}\nSTATUS: ${r.status}\nCT: ${r.headers.get("content-type")}\n---\n${text.slice(0, 800)}`); } catch (_) {}
-    STOOQ_SAMPLE_SAVED = true;
-  }
-  if (!text || text.toLowerCase().includes("no data") || text.length < 80) throw new Error("Stooq: empty/no-data");
-  const lines = text.trim().split(/\r?\n/);
-  const header = lines[0].toLowerCase().split(",");
-  const idx = Object.fromEntries(header.map((h, i) => [h.trim(), i]));
-  for (const k of ["date", "open", "high", "low", "close"]) if (!(k in idx)) throw new Error(`Stooq: missing col ${k}`);
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const p = lines[i].split(",");
-    const d = p[idx.date];
-    const o = +p[idx.open], h = +p[idx.high], l = +p[idx.low], c = +p[idx.close];
-    if (d && o > 0 && h > 0 && l > 0 && c > 0) rows.push({ d, o, h, l, c });
-  }
-  if (rows.length < 50) throw new Error(`Stooq: only ${rows.length} rows`);
-  return rows;
+async function fetchWithProxy(url, proxyBuilder) {
+  const finalUrl = proxyBuilder ? proxyBuilder(url) : url;
+  const r = await fetch(finalUrl, { headers: { "User-Agent": UA, "Accept": "application/json" } });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
 }
 
-function trimYears(rows, years) {
-  const cutoff = new Date(Date.now() - years * 365.25 * 86400 * 1000).toISOString().slice(0, 10);
+const YAHOO_PROXIES = [
+  { name: "direct",     build: null },
+  { name: "allorigins", build: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { name: "corsproxy",  build: u => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+  { name: "codetabs",   build: u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
+];
+
+async function fetchYahoo(symbol) {
+  const url = yahooChartUrl(symbol);
+  const errs = [];
+  for (const p of YAHOO_PROXIES) {
+    try {
+      const j = await fetchWithProxy(url, p.build);
+      return { rows: parseYahooJson(j), source: `yahoo:${p.name}` };
+    } catch (e) { errs.push(`${p.name}:${e.message}`); }
+  }
+  throw new Error(errs.join("; "));
+}
+
+async function fetchTwelveData(symbol) {
+  if (!TWELVEDATA_KEY) throw new Error("no TWELVEDATA_KEY");
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=1800&apikey=${TWELVEDATA_KEY}`;
+  const r = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (!r.ok) throw new Error(`TD HTTP ${r.status}`);
+  const j = await r.json();
+  if (j.status === "error") throw new Error(`TD: ${j.message}`);
+  if (!Array.isArray(j.values)) throw new Error("TD: no values");
+  const rows = j.values.map(v => ({
+    d: v.datetime,
+    o: +parseFloat(v.open).toFixed(4),
+    h: +parseFloat(v.high).toFixed(4),
+    l: +parseFloat(v.low).toFixed(4),
+    c: +parseFloat(v.close).toFixed(4),
+  })).filter(r => r.o > 0 && r.h > 0 && r.l > 0 && r.c > 0);
+  if (rows.length < 50) throw new Error(`TD: only ${rows.length} rows`);
+  return { rows, source: "twelvedata" };
+}
+
+function trimSort(rows) {
+  const cutoff = new Date(Date.now() - YEARS_BACK * 365.25 * 86400 * 1000).toISOString().slice(0, 10);
   return rows.filter(r => r.d >= cutoff).sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
 }
 
@@ -97,57 +113,52 @@ function trimYears(rows, years) {
   const manifest = { generated: new Date().toISOString(), symbols: [] };
   const debug = [];
 
-  // Network smoke test
-  for (const url of ["https://query1.finance.yahoo.com/", "https://stooq.com/"]) {
-    try {
-      const r = await fetch(url, { headers: { "User-Agent": UA } });
-      debug.push(`probe ${url} -> ${r.status}`);
-    } catch (e) { debug.push(`probe ${url} FAIL: ${e.message}`); }
-  }
+  debug.push(`TWELVEDATA_KEY: ${TWELVEDATA_KEY ? "set" : "not set"}`);
 
   for (const sym of SYMBOLS) {
     const file = path.join(DATA_DIR, safeName(sym.id) + ".json");
-    let rows = null, source = null, lastErr = null, yErr = null, sErr = null;
-    try { rows = trimYears(await fetchYahoo(sym.yahoo), YEARS_BACK); source = "yahoo"; }
-    catch (e) { yErr = e; lastErr = e; }
+    let got = null, yErr = null, tErr = null;
 
-    if (!rows) {
-      try { rows = trimYears(await fetchStooq(sym.stooq), YEARS_BACK); source = "stooq"; }
-      catch (e2) { sErr = e2; lastErr = e2; }
+    try { got = await fetchYahoo(sym.yahoo); }
+    catch (e) { yErr = e.message; }
+
+    if (!got) {
+      try { got = await fetchTwelveData(sym.td); }
+      catch (e) { tErr = e.message; }
     }
 
-    debug.push(`${sym.id}: yahoo=${yErr ? "FAIL " + yErr.message : "ok"} | stooq=${sErr ? "FAIL " + sErr.message : rows ? (source === "stooq" ? "ok" : "skipped") : "n/a"}`);
-
-    if (rows && rows.length >= 50) {
-      const last = rows[rows.length - 1];
-      fs.writeFileSync(file,
-        JSON.stringify({ ...sym, file: path.basename(file), source, rows }) + "\n"
-      );
-      manifest.symbols.push({
-        id: sym.id, name: sym.name, tz: sym.tz, region: sym.region, role: sym.role,
-        file: path.basename(file), rows: rows.length, lastDate: last.d, lastClose: last.c, source,
-      });
-      console.log(`OK  ${sym.id.padEnd(8)} via ${source} · ${rows.length} rows · last ${last.d} ${last.c}`);
-    } else {
-      console.error(`ERR ${sym.id.padEnd(8)} ${lastErr?.message || "unknown"}`);
-      if (fs.existsSync(file)) {
-        try {
-          const existing = JSON.parse(fs.readFileSync(file, "utf8"));
-          const last = existing.rows[existing.rows.length - 1];
-          manifest.symbols.push({
-            id: sym.id, name: sym.name, tz: sym.tz, region: sym.region, role: sym.role,
-            file: path.basename(file), rows: existing.rows.length, lastDate: last.d, lastClose: last.c,
-            source: existing.source || "cache", stale: true,
-          });
-        } catch (_) {}
+    if (got) {
+      const rows = trimSort(got.rows);
+      if (rows.length >= 50) {
+        const last = rows[rows.length - 1];
+        fs.writeFileSync(file, JSON.stringify({ ...sym, file: path.basename(file), source: got.source, rows }) + "\n");
+        manifest.symbols.push({
+          id: sym.id, name: sym.name, tz: sym.tz, region: sym.region, role: sym.role,
+          file: path.basename(file), rows: rows.length, lastDate: last.d, lastClose: last.c, source: got.source,
+        });
+        debug.push(`OK  ${sym.id} via ${got.source} · ${rows.length} rows · last ${last.d}`);
+        console.log(`OK  ${sym.id} via ${got.source} · ${rows.length} rows`);
+        await new Promise(r => setTimeout(r, 200));
+        continue;
       }
     }
 
-    await new Promise(r => setTimeout(r, 300)); // gentle rate limit
+    debug.push(`ERR ${sym.id} yahoo=${yErr || "n/a"} | td=${tErr || "n/a"}`);
+    console.error(`ERR ${sym.id} yahoo=${yErr} | td=${tErr}`);
+    if (fs.existsSync(file)) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(file, "utf8"));
+        const last = existing.rows[existing.rows.length - 1];
+        manifest.symbols.push({
+          id: sym.id, name: sym.name, tz: sym.tz, region: sym.region, role: sym.role,
+          file: path.basename(file), rows: existing.rows.length, lastDate: last.d, lastClose: last.c,
+          source: existing.source || "cache", stale: true,
+        });
+      } catch (_) {}
+    }
   }
 
   fs.writeFileSync(path.join(DATA_DIR, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
   fs.writeFileSync(path.join(DATA_DIR, "debug.log"), debug.join("\n") + "\n");
-  console.log(`\nDone: ${manifest.symbols.length}/${SYMBOLS.length} symbols in manifest.`);
-  console.log(debug.join("\n"));
+  console.log(`\nDone: ${manifest.symbols.length}/${SYMBOLS.length} symbols written.`);
 })().catch(e => { console.error("FATAL", e); process.exit(1); });
