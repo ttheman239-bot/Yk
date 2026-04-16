@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BreathingCompanion" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:statusBarColor">#0a0f1c</item>
+        <item name="android:windowBackground">@color/bg</item>
+    </style>
+</resources>
