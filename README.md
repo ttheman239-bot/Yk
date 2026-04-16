@@ -1,29 +1,36 @@
-# Market Clock & Arbitrage
+# Lead-Lag Signal Analyzer
 
-Single-file web app for tracking stock-market sessions across timezones and watching dual-listed stocks for arbitrage gaps.
+วิเคราะห์ความสัมพันธ์แบบ lead-lag ระหว่างตลาดหุ้นทั่วโลก (timezone arbitrage) — กดทำนายได้ว่าถ้า S&P 500 ขึ้น X% วันนี้ ตลาดเอเชียวันถัดไปจะตอบสนองอย่างไร พร้อม backtest ทางสถิติ
 
-## Features
+## ฟีเจอร์
 
-- **Market clock** — live status (open / lunch / closed), countdown to next open or close, and local time for 20 major exchanges: NYSE, NASDAQ, TSX, B3, LSE, Euronext, Xetra, SIX, MOEX, JSE, NSE India, SET, SGX, HKEX, SSE, TWSE, KRX, TSE Tokyo, ASX, NZX. Lunch breaks are handled where they exist.
-- **Dual-listed arbitrage** — pre-seeded pairs (BABA/9988, TSM/2330, TM/7203, BHP US/AU, RIO US/UK) plus a form to add your own. Prices auto-refresh every minute from Stooq. A FX leg converts the legs to a common currency; the spread column shows `((B × FX) / A − 1) × 100%`.
-- **Portrait Android app** wrapping the same HTML in a WebView, built to APK via GitHub Actions.
+- **Pair Analysis** — เลือก leader (S&P, NDX, VIX, oil, gold, BTC, DAX, FTSE) + follower (SET, Nikkei, HSI, KOSPI, STI, TWSE, SSE, ASX, Nifty) → ได้:
+  - Current signal (เทรดตามสัญญาณวันนี้คาดว่าได้เท่าไร)
+  - Correlation, β, R², t-stat (นัยสำคัญทางสถิติ)
+  - Hit rate + conditional returns (leader up → follower avg, leader down → follower avg)
+  - Backtest Sharpe, equity curve, final P&L
+  - Scatter plot + regression line
+- **Screener** — เลือก leader แล้วดู follower ทุกตัวเรียงตาม Sharpe
 
-## Use
+## สถาปัตยกรรมข้อมูล
 
-Open `index.html` in any browser. No build, no dependencies.
-
-Symbols use Stooq format: `aapl.us`, `9988.hk`, `7203.jp`, `ptt.th`, `bhp.au`, `2330.tw`, `hsbc.uk`. FX symbols look like `usdhkd`, `usdjpy`. Leave FX blank when both legs share a currency.
+`.github/workflows/fetch-data.yml` run cron วันละ 2 ครั้ง (หลัง US close + หลัง Asia close) ดึงข้อมูลจาก Stooq ด้วย `scripts/fetch-data.js` เขียน `data/<symbol>.json` แล้ว commit กลับเข้า repo แอพอ่านจาก `raw.githubusercontent.com` ดังนั้นใช้งานได้ทั้งบนเว็บและใน Android WebView (CORS OK)
 
 ## Android APK
 
-Every push to `main` or a `claude/**` branch triggers the `Build Android APK` workflow, which publishes the APK to a rolling `snapshot` GitHub Release.
+Push ใด ๆ ไป `main` หรือ `claude/**` → `.github/workflows/build-apk.yml` build APK แล้ว publish ไป `snapshot` release
 
-**Direct download:** https://github.com/ttheman239-bot/Yk/releases/download/snapshot/market-clock.apk
+**ดาวน์โหลดตรง:** https://github.com/ttheman239-bot/Yk/releases/download/snapshot/lead-lag.apk
 
-Local build (requires Android SDK + JDK 17):
+## Local
 
 ```
-cp index.html android/app/src/main/assets/index.html
-cd android
-./gradlew :app:assembleDebug
+open index.html
+```
+
+หรือ build APK เอง (ต้องมี Android SDK + JDK 17):
+
+```
+cp index.html app.js android/app/src/main/assets/
+cd android && ./gradlew :app:assembleDebug
 ```

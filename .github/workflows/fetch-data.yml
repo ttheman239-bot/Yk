@@ -1,0 +1,46 @@
+name: Fetch market data
+
+on:
+  schedule:
+    # Run once a day after US markets close (21:30 UTC ≈ 17:30 NY) and after Asian close (10:00 UTC)
+    - cron: '30 21 * * 1-6'
+    - cron: '0 10 * * 1-6'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/fetch-data.js'
+      - '.github/workflows/fetch-data.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-data-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch data
+        run: node scripts/fetch-data.js
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No data changes"
+          else
+            git commit -m "Update market data ($(date -u +%Y-%m-%d))"
+            git push
+          fi
