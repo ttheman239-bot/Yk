@@ -1,21 +1,20 @@
-probe https://query1.finance.yahoo.com/ -> 429
-probe https://stooq.com/ -> 200
-^spx: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^ndx: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^dji: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^vix: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-wti: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: empty/no-data
-gold: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: empty/no-data
-dxy: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-btc: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^dax: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^ftm: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^set: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^nkx: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^hsi: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^kospi: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^sti: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^twse: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^shc: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^axjo: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
-^nsei: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+TWELVEDATA_KEY: not set
+OK  ^spx via yahoo:corsproxy · 1758 rows · last 2026-04-16
+OK  ^ndx via yahoo:corsproxy · 1758 rows · last 2026-04-16
+OK  ^dji via yahoo:corsproxy · 1758 rows · last 2026-04-16
+OK  ^vix via yahoo:corsproxy · 1758 rows · last 2026-04-16
+OK  wti via yahoo:corsproxy · 1758 rows · last 2026-04-16
+OK  gold via yahoo:corsproxy · 1760 rows · last 2026-04-16
+OK  dxy via yahoo:corsproxy · 1760 rows · last 2026-04-16
+OK  btc via yahoo:corsproxy · 2556 rows · last 2026-04-16
+OK  ^dax via yahoo:corsproxy · 1774 rows · last 2026-04-15
+OK  ^ftm via yahoo:corsproxy · 1762 rows · last 2026-04-15
+OK  ^set via yahoo:corsproxy · 1686 rows · last 2026-04-10
+OK  ^nkx via yahoo:corsproxy · 1703 rows · last 2026-04-15
+OK  ^hsi via yahoo:corsproxy · 1717 rows · last 2026-04-15
+OK  ^kospi via yahoo:corsproxy · 1714 rows · last 2026-04-15
+OK  ^sti via yahoo:corsproxy · 1754 rows · last 2026-04-15
+OK  ^twse via yahoo:corsproxy · 1697 rows · last 2026-04-15
+OK  ^shc via yahoo:corsproxy · 1692 rows · last 2026-04-15
+OK  ^axjo via yahoo:corsproxy · 1766 rows · last 2026-04-15
+OK  ^nsei via yahoo:corsproxy · 1723 rows · last 2026-04-15
