@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>News Impact Analysis - S&P 500 Spillover Research</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="navbar">
+    <h1><span>News Impact</span> Analysis Dashboard</h1>
+    <div class="nav-controls">
+        <select id="select-days">
+            <option value="30">Last 30 Days</option>
+            <option value="60">Last 60 Days</option>
+            <option value="90" selected>Last 90 Days</option>
+            <option value="180">Last 180 Days</option>
+            <option value="365">Last 1 Year</option>
+        </select>
+        <button id="btn-fetch" onclick="fetchNews()">Fetch News</button>
+        <button id="btn-fetch-markets" onclick="fetchMarkets()">Fetch Markets</button>
+        <button id="btn-analyze" onclick="runAnalysis()">Run Analysis</button>
+    </div>
+</nav>
+
+<div class="container">
+    <!-- Stats Row -->
+    <div class="stats-row">
+        <div class="stat-card">
+            <div class="label">News Articles</div>
+            <div class="value blue" id="stat-news">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Markets Tracked</div>
+            <div class="value green" id="stat-markets">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Trading Days</div>
+            <div class="value orange" id="stat-days">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Analysis Results</div>
+            <div class="value purple" id="stat-analyses">0</div>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <div class="tab active" data-tab="tab-overview">Overview</div>
+        <div class="tab" data-tab="tab-market-detail">Market Detail</div>
+        <div class="tab" data-tab="tab-categories">Category Impact</div>
+        <div class="tab" data-tab="tab-news">News Feed</div>
+    </div>
+
+    <!-- Tab: Overview -->
+    <div id="tab-overview" class="tab-content active">
+        <div class="chart-grid" id="charts-overview">
+            <div class="loading">
+                Click <strong>"Fetch News"</strong> and <strong>"Fetch Markets"</strong> first,
+                then click <strong>"Run Analysis"</strong> to generate charts.
+            </div>
+        </div>
+
+        <!-- Correlation Summary Table -->
+        <div class="chart-card full-width" style="margin-top: 20px;">
+            <h3>S&P 500 Spillover Correlation Summary</h3>
+            <table class="corr-table">
+                <thead>
+                    <tr>
+                        <th>Target Market</th>
+                        <th>Correlation</th>
+                        <th>Gap Correlation</th>
+                        <th>Sample Size</th>
+                        <th>Significant</th>
+                        <th>Top Impact Categories</th>
+                    </tr>
+                </thead>
+                <tbody id="corr-table-body">
+                    <tr><td colspan="6" style="text-align:center; color: var(--text-secondary);">Run analysis to see results</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Tab: Market Detail -->
+    <div id="tab-market-detail" class="tab-content">
+        <div class="market-selector">
+            {% for key in spillover_targets %}
+            <button class="market-btn {% if key == 'NIKKEI' %}active{% endif %}"
+                    data-market="{{ key }}">
+                {{ markets[key].name }}
+            </button>
+            {% endfor %}
+        </div>
+        <div class="chart-grid" id="charts-detail">
+            <div class="loading">Run analysis to see market-specific spillover charts.</div>
+        </div>
+    </div>
+
+    <!-- Tab: Category Impact -->
+    <div id="tab-categories" class="tab-content">
+        <h3 style="margin-bottom: 16px; color: var(--text-secondary);">
+            News Category Spillover Impact Report
+        </h3>
+        <p style="margin-bottom: 20px; color: var(--text-secondary); font-size: 0.9rem;">
+            Shows how each type of news during S&P 500 trading hours affects
+            markets that open after the US market closes. A spillover ratio of 1.0
+            means the target market moves by the same percentage as the S&P 500.
+        </p>
+        <div class="category-grid" id="category-report">
+            <div class="loading">Run analysis to see category impact report.</div>
+        </div>
+    </div>
+
+    <!-- Tab: News Feed -->
+    <div id="tab-news" class="tab-content">
+        <div class="chart-card">
+            <h3>Latest Financial News (Classified)</h3>
+            <div class="news-feed" id="news-feed">
+                <div class="loading">No news loaded yet. Click "Fetch News" to start.</div>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>
