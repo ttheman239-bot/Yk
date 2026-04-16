@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Breathing Companion</title>
+<style>
+  :root {
+    --bg-0: #0a0f1c;
+    --bg-1: #111a2e;
+    --accent: #7ecbff;
+    --accent-soft: rgba(126, 203, 255, 0.18);
+    --text: #e8f1ff;
+    --muted: #8ea3c4;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+    background: radial-gradient(ellipse at top, var(--bg-1), var(--bg-0));
+    overflow: hidden;
+  }
+
+  .app {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    height: 100%;
+    padding: 2rem 1rem;
+  }
+
+  header {
+    text-align: center;
+  }
+
+  h1 {
+    font-size: 1.25rem;
+    font-weight: 400;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .stage {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2rem;
+    width: 100%;
+  }
+
+  .orb-wrap {
+    position: relative;
+    width: min(60vmin, 360px);
+    height: min(60vmin, 360px);
+    display: grid;
+    place-items: center;
+  }
+
+  .orb {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, var(--accent-soft), transparent 70%);
+    border: 1px solid var(--accent-soft);
+    transform: scale(0.5);
+    transition: transform linear;
+    box-shadow: 0 0 80px var(--accent-soft), inset 0 0 60px var(--accent-soft);
+  }
+
+  .orb.inhale { transform: scale(1); }
+  .orb.hold-in, .orb.hold-out { /* scale preserved from previous phase via JS */ }
+  .orb.exhale { transform: scale(0.5); }
+
+  .phase {
+    position: relative;
+    z-index: 2;
+    text-align: center;
+    pointer-events: none;
+  }
+
+  .phase .label {
+    font-size: 1.5rem;
+    font-weight: 300;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+
+  .phase .count {
+    font-size: 3.5rem;
+    font-weight: 200;
+    font-variant-numeric: tabular-nums;
+    margin-top: 0.25rem;
+    color: var(--accent);
+  }
+
+  .patterns {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .patterns button {
+    background: transparent;
+    border: 1px solid var(--accent-soft);
+    color: var(--muted);
+    padding: 0.5rem 1rem;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    transition: all 0.2s;
+  }
+
+  .patterns button:hover { color: var(--text); }
+  .patterns button.active {
+    background: var(--accent-soft);
+    color: var(--text);
+    border-color: var(--accent);
+  }
+
+  footer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    width: 100%;
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+  }
+
+  .play {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: none;
+    color: var(--bg-0);
+    font-size: 1.5rem;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    transition: transform 0.2s, box-shadow 0.2s;
+    box-shadow: 0 8px 32px rgba(126, 203, 255, 0.3);
+  }
+
+  .play:hover { transform: scale(1.05); }
+  .play:active { transform: scale(0.95); }
+
+  .timer {
+    font-variant-numeric: tabular-nums;
+    font-size: 1rem;
+    color: var(--muted);
+    letter-spacing: 0.1em;
+    min-width: 4ch;
+    text-align: center;
+  }
+
+  .pattern-desc {
+    font-size: 0.85rem;
+    color: var(--muted);
+    text-align: center;
+    min-height: 1.2em;
+  }
+
+  @media (max-width: 480px) {
+    .phase .label { font-size: 1.1rem; }
+    .phase .count { font-size: 2.5rem; }
+    h1 { font-size: 1rem; }
+  }
+</style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Breathing Companion</h1>
+    </header>
+
+    <div class="stage">
+      <div class="patterns" id="patterns"></div>
+      <div class="pattern-desc" id="desc"></div>
+
+      <div class="orb-wrap">
+        <div class="orb" id="orb"></div>
+        <div class="phase">
+          <div class="label" id="phaseLabel">Ready</div>
+          <div class="count" id="phaseCount">—</div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <div class="controls">
+        <div class="timer" id="timer">00:00</div>
+        <button class="play" id="playBtn" aria-label="Start">▶</button>
+        <div class="timer" id="cycles">0 cycles</div>
+      </div>
+    </footer>
+  </div>
+
+<script>
+  const PATTERNS = {
+    box: {
+      name: "Box 4-4-4-4",
+      desc: "Calm focus. Equal inhale, hold, exhale, hold.",
+      steps: [
+        { phase: "inhale", label: "Inhale", seconds: 4 },
+        { phase: "hold-in", label: "Hold", seconds: 4 },
+        { phase: "exhale", label: "Exhale", seconds: 4 },
+        { phase: "hold-out", label: "Hold", seconds: 4 },
+      ],
+    },
+    relax: {
+      name: "4-7-8",
+      desc: "Deep relaxation. Longer exhale releases tension.",
+      steps: [
+        { phase: "inhale", label: "Inhale", seconds: 4 },
+        { phase: "hold-in", label: "Hold", seconds: 7 },
+        { phase: "exhale", label: "Exhale", seconds: 8 },
+      ],
+    },
+    coherent: {
+      name: "Coherent 5-5",
+      desc: "Balanced heart rhythm. Five in, five out.",
+      steps: [
+        { phase: "inhale", label: "Inhale", seconds: 5 },
+        { phase: "exhale", label: "Exhale", seconds: 5 },
+      ],
+    },
+  };
+
+  const orb = document.getElementById("orb");
+  const phaseLabel = document.getElementById("phaseLabel");
+  const phaseCount = document.getElementById("phaseCount");
+  const playBtn = document.getElementById("playBtn");
+  const timerEl = document.getElementById("timer");
+  const cyclesEl = document.getElementById("cycles");
+  const patternsEl = document.getElementById("patterns");
+  const descEl = document.getElementById("desc");
+
+  let current = "box";
+  let running = false;
+  let stepIndex = 0;
+  let secondsLeft = 0;
+  let tickHandle = null;
+  let sessionStart = 0;
+  let cycleCount = 0;
+
+  function renderPatterns() {
+    patternsEl.innerHTML = "";
+    for (const [key, p] of Object.entries(PATTERNS)) {
+      const btn = document.createElement("button");
+      btn.textContent = p.name;
+      btn.className = key === current ? "active" : "";
+      btn.addEventListener("click", () => {
+        current = key;
+        reset();
+        renderPatterns();
+        descEl.textContent = PATTERNS[current].desc;
+      });
+      patternsEl.appendChild(btn);
+    }
+    descEl.textContent = PATTERNS[current].desc;
+  }
+
+  function formatTime(ms) {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+  }
+
+  function applyPhase(step) {
+    orb.classList.remove("inhale", "hold-in", "hold-out", "exhale");
+    orb.style.transitionDuration = step.seconds + "s";
+    orb.classList.add(step.phase);
+    phaseLabel.textContent = step.label;
+  }
+
+  function reset() {
+    running = false;
+    clearInterval(tickHandle);
+    tickHandle = null;
+    stepIndex = 0;
+    secondsLeft = 0;
+    cycleCount = 0;
+    playBtn.textContent = "▶";
+    phaseLabel.textContent = "Ready";
+    phaseCount.textContent = "—";
+    timerEl.textContent = "00:00";
+    cyclesEl.textContent = "0 cycles";
+    orb.classList.remove("inhale", "hold-in", "hold-out", "exhale");
+    orb.style.transitionDuration = "0.8s";
+  }
+
+  function nextStep() {
+    const pattern = PATTERNS[current];
+    const step = pattern.steps[stepIndex];
+    applyPhase(step);
+    secondsLeft = step.seconds;
+    phaseCount.textContent = secondsLeft;
+  }
+
+  function tick() {
+    if (!running) return;
+    const pattern = PATTERNS[current];
+    timerEl.textContent = formatTime(Date.now() - sessionStart);
+
+    secondsLeft -= 1;
+    if (secondsLeft <= 0) {
+      stepIndex = (stepIndex + 1) % pattern.steps.length;
+      if (stepIndex === 0) {
+        cycleCount += 1;
+        cyclesEl.textContent = `${cycleCount} cycle${cycleCount === 1 ? "" : "s"}`;
+      }
+      nextStep();
+    } else {
+      phaseCount.textContent = secondsLeft;
+    }
+  }
+
+  function start() {
+    running = true;
+    playBtn.textContent = "❚❚";
+    sessionStart = Date.now() - (() => {
+      const [m, s] = timerEl.textContent.split(":").map(Number);
+      return (m * 60 + s) * 1000;
+    })();
+    nextStep();
+    tickHandle = setInterval(tick, 1000);
+  }
+
+  function pause() {
+    running = false;
+    clearInterval(tickHandle);
+    tickHandle = null;
+    playBtn.textContent = "▶";
+  }
+
+  playBtn.addEventListener("click", () => {
+    if (running) pause();
+    else start();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      playBtn.click();
+    }
+  });
+
+  renderPatterns();
+  reset();
+</script>
+</body>
+</html>
