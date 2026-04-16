@@ -1,0 +1,21 @@
+probe https://query1.finance.yahoo.com/ -> 429
+probe https://stooq.com/ -> 200
+^spx: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^ndx: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^dji: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^vix: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+wti: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: empty/no-data
+gold: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: empty/no-data
+dxy: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+btc: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^dax: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^ftm: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^set: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^nkx: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^hsi: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^kospi: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^sti: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^twse: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^shc: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^axjo: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
+^nsei: yahoo=FAIL Yahoo HTTP 429 | stooq=FAIL Stooq: missing col date
