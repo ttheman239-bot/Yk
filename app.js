@@ -54,7 +54,8 @@ function alignSeries(leader, follower, lag) {
     if (!(fCurr.c > 0) || !(fPrev.c > 0) || !(fCurr.o > 0)) continue;
     const rF_cc = fCurr.c / fPrev.c - 1;
     const rF_oc = fCurr.c / fCurr.o - 1;
-    pairs.push({ dL, dF: fCurr.d, rL, rF_cc, rF_oc });
+    const rF_co = fCurr.o / fPrev.c - 1; // overnight gap (close→open)
+    pairs.push({ dL, dF: fCurr.d, rL, rF_cc, rF_oc, rF_co });
   }
   return pairs;
 }
@@ -82,12 +83,19 @@ function regress(x, y) {
 }
 
 // Backtest: on each day where |rL| > thr, take position sign(rL) in follower, realised return = sign(rL) * rF.
+function retOf(p, mode) {
+  return mode === "oc" ? p.rF_oc : mode === "co" ? p.rF_co : p.rF_cc;
+}
+
+// Backtest: on each day where |rL| > thr, take position sign(rL) in follower.
 function backtest(pairs, thr, mode) {
   const equity = [{ d: pairs[0]?.dL || "", v: 1 }];
+  const drawdowns = [];
+  let peak = 1;
   let hits = 0, trades = 0, sumRet = 0, sumRet2 = 0;
   const upRets = [], dnRets = [];
   for (const p of pairs) {
-    const rF = mode === "oc" ? p.rF_oc : p.rF_cc;
+    const rF = retOf(p, mode);
     let dayRet = 0;
     if (Math.abs(p.rL) >= thr) {
       const side = p.rL > 0 ? 1 : -1;
@@ -99,13 +107,17 @@ function backtest(pairs, thr, mode) {
       sumRet2 += dayRet * dayRet;
     }
     const last = equity[equity.length - 1].v;
-    equity.push({ d: p.dF, v: last * (1 + dayRet) });
+    const newV = last * (1 + dayRet);
+    equity.push({ d: p.dF, v: newV });
+    if (newV > peak) peak = newV;
+    drawdowns.push((newV - peak) / peak);
   }
   const avgRet = trades ? sumRet / trades : 0;
   const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avgRet * avgRet) : 0;
   const sharpe = std > 0 ? (avgRet / std) * Math.sqrt(252) : 0;
+  const maxDD = drawdowns.length ? Math.min(...drawdowns) : 0;
   return {
-    equity, trades,
+    equity, trades, drawdowns, maxDD,
     hitRate: trades ? hits / trades : 0,
     avgRet, sharpe,
     upMean: mean(upRets), upN: upRets.length,
@@ -138,13 +150,13 @@ function svgLine(points, w, h, color) {
 function svgScatter(pairs, mode, reg, w, h) {
   if (!pairs.length) return "";
   const xs = pairs.map(p => p.rL * 100);
-  const ys = pairs.map(p => (mode === "oc" ? p.rF_oc : p.rF_cc) * 100);
+  const ys = pairs.map(p => retOf(p, mode) * 100);
   const mnX = Math.min(...xs), mxX = Math.max(...xs);
   const mnY = Math.min(...ys), mxY = Math.max(...ys);
   const pad = 24;
   const sx = v => pad + ((v - mnX) / (mxX - mnX || 1)) * (w - 2 * pad);
   const sy = v => h - pad - ((v - mnY) / (mxY - mnY || 1)) * (h - 2 * pad);
-  const dots = pairs.map(p => `<circle cx="${sx(p.rL * 100).toFixed(1)}" cy="${sy((mode === "oc" ? p.rF_oc : p.rF_cc) * 100).toFixed(1)}" r="1.5" fill="rgba(126,203,255,.5)"/>`).join("");
+  const dots = pairs.map(p => `<circle cx="${sx(p.rL * 100).toFixed(1)}" cy="${sy(retOf(p, mode) * 100).toFixed(1)}" r="1.5" fill="rgba(126,203,255,.5)"/>`).join("");
   const x1 = mnX, x2 = mxX;
   const y1 = reg.a * 100 + reg.b * x1;
   const y2 = reg.a * 100 + reg.b * x2;
@@ -168,6 +180,10 @@ async function loadSeries(symId, years) {
   return { ...j, rows };
 }
 
+const MODE_LABEL = { cc: "close→close", oc: "open→close (intraday)", co: "close→open (overnight gap)" };
+
+function modeRet(p, mode) { return retOf(p, mode); }
+
 async function runPair() {
   const out = document.getElementById("pOut");
   out.innerHTML = `<div class="loading">Loading data…</div>`;
@@ -183,7 +199,7 @@ async function runPair() {
     const pairs = alignSeries(L, F, lag);
     if (pairs.length < 30) throw new Error(`Too few aligned samples (${pairs.length})`);
     const xs = pairs.map(p => p.rL);
-    const ys = pairs.map(p => mode === "oc" ? p.rF_oc : p.rF_cc);
+    const ys = pairs.map(p => modeRet(p, mode));
     const reg = regress(xs, ys);
     const bt = backtest(pairs, thr, mode);
 
@@ -193,12 +209,61 @@ async function runPair() {
     const dir = predF >= 0 ? "up" : "dn";
     const dirTxt = predF >= 0 ? "ขึ้น" : "ลง";
 
+    // Lag scan: lags 1..5
+    const lagRows = [];
+    for (let k = 1; k <= 5; k++) {
+      const pp = alignSeries(L, F, k);
+      if (pp.length < 30) { lagRows.push({ k, skipped: true }); continue; }
+      const rg = regress(pp.map(p => p.rL), pp.map(p => modeRet(p, mode)));
+      const b = backtest(pp, thr, mode);
+      lagRows.push({ k, corr: rg.corr, t: rg.t, hit: b.hitRate, sharpe: b.sharpe, finalV: b.finalV, trades: b.trades });
+    }
+    const lagTable = `
+      <div class="chart"><h3>Lag scan (same mode, same threshold)</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>Lag</th><th>Corr</th><th>t</th><th>Hit</th><th>Sharpe</th><th>Equity</th><th>N</th></tr></thead>
+          <tbody>${lagRows.map(r => r.skipped ? `<tr><td>${r.k}</td><td colspan="6" style="color:var(--muted)">n/a</td></tr>` : `
+            <tr${r.k === lag ? ' style="background:var(--panel-2)"' : ''}>
+              <td>${r.k}</td>
+              <td class="${cls(r.corr)}">${fmtNum(r.corr, 3)}</td>
+              <td class="${Math.abs(r.t) >= 2 ? "pos" : ""}">${fmtNum(r.t, 2)}</td>
+              <td>${fmtPct(r.hit, 1)}</td>
+              <td class="${cls(r.sharpe)}">${fmtNum(r.sharpe, 2)}</td>
+              <td class="${r.finalV >= 1 ? "pos" : "neg"}">${fmtNum(r.finalV, 2)}×</td>
+              <td>${r.trades}</td>
+            </tr>`).join("")}</tbody>
+        </table></div>
+      </div>`;
+
+    // Recent signals (last 15 days where signal would have fired)
+    const recent = pairs.slice(-40).filter(p => Math.abs(p.rL) >= thr).slice(-15);
+    const recentRows = recent.map(p => {
+      const rF = modeRet(p, mode);
+      const pred = reg.a + reg.b * p.rL;
+      const hit = (p.rL > 0 && rF > 0) || (p.rL < 0 && rF < 0);
+      return `
+        <tr>
+          <td>${p.dL} → ${p.dF}</td>
+          <td class="${cls(p.rL)}">${fmtPct(p.rL, 2)}</td>
+          <td class="${cls(pred)}">${fmtPct(pred, 2)}</td>
+          <td class="${cls(rF)}">${fmtPct(rF, 2)}</td>
+          <td class="${hit ? "pos" : "neg"}">${hit ? "✓" : "✗"}</td>
+        </tr>`;
+    }).join("");
+    const recentTable = `
+      <div class="chart"><h3>Recent signals (last ${recent.length})</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>Dates</th><th>Leader</th><th>Predicted</th><th>Actual</th><th>Hit</th></tr></thead>
+          <tbody>${recentRows || `<tr><td colspan="5" style="color:var(--muted)">No signals fired — threshold too high?</td></tr>`}</tbody>
+        </table></div>
+      </div>`;
+
     out.innerHTML = `
       <div class="signal">
-        <div class="h">Current signal</div>
+        <div class="h">Current signal · ${MODE_LABEL[mode]} · lag ${lag}</div>
         <div class="b">
           ${L.name} ${latest.dL}: <span class="em ${latestL >= 0 ? "up" : "dn"}">${fmtPct(latestL)}</span>
-          → คาดว่า ${F.name} ${latest.dF} (${mode === "oc" ? "open→close" : "close→close"})
+          → คาดว่า ${F.name} ${latest.dF}
           จะ<span class="em ${dir}">${dirTxt} ${fmtPct(Math.abs(predF))}</span>
           (β=${fmtNum(reg.b)}, α=${fmtPct(reg.a, 3)})
         </div>
@@ -211,12 +276,15 @@ async function runPair() {
         <div class="stat"><div class="l">Hit rate</div><div class="v">${fmtPct(bt.hitRate, 1)}</div><div class="s">${bt.trades} trades</div></div>
         <div class="stat"><div class="l">Leader up → follower</div><div class="v ${cls(bt.upMean)}">${fmtPct(bt.upMean, 2)}</div><div class="s">N=${bt.upN}</div></div>
         <div class="stat"><div class="l">Leader down → follower</div><div class="v ${cls(bt.dnMean)}">${fmtPct(bt.dnMean, 2)}</div><div class="s">N=${bt.dnN}</div></div>
-        <div class="stat"><div class="l">Backtest Sharpe</div><div class="v ${cls(bt.sharpe)}">${fmtNum(bt.sharpe, 2)}</div><div class="s">ann., rf=0</div></div>
+        <div class="stat"><div class="l">Sharpe (ann.)</div><div class="v ${cls(bt.sharpe)}">${fmtNum(bt.sharpe, 2)}</div><div class="s">signal-only</div></div>
         <div class="stat"><div class="l">Final equity</div><div class="v ${bt.finalV >= 1 ? "pos" : "neg"}">${fmtNum(bt.finalV, 3)}×</div><div class="s">${fmtPct(bt.finalV - 1, 1)}</div></div>
+        <div class="stat"><div class="l">Max drawdown</div><div class="v neg">${fmtPct(bt.maxDD, 1)}</div><div class="s">peak→trough</div></div>
       </div>
 
       <div class="chart"><h3>Equity curve (signal-only)</h3>${svgLine(bt.equity, 320, 120, "#4ade80")}</div>
-      <div class="chart"><h3>Scatter: leader vs follower</h3>${svgScatter(pairs, mode, reg, 320, 180)}</div>
+      ${lagTable}
+      ${recentTable}
+      <div class="chart"><h3>Scatter: leader vs follower (${MODE_LABEL[mode]})</h3>${svgScatter(pairs, mode, reg, 320, 180)}</div>
     `;
   } catch (e) {
     out.innerHTML = `<div class="err">Error: ${e.message}</div>`;
@@ -296,6 +364,8 @@ async function boot() {
     document.getElementById("pLeader").value = "^spx";
     document.getElementById("pFollower").value = "^set";
     document.getElementById("sLeader").value = "^spx";
+    // Auto-run initial pair analysis
+    runPair().catch(() => {});
   } catch (e) {
     meta.textContent = "no data yet";
     document.body.insertAdjacentHTML("afterbegin",
@@ -308,6 +378,10 @@ async function boot() {
   }));
   document.getElementById("pGo").addEventListener("click", runPair);
   document.getElementById("sGo").addEventListener("click", runScreener);
+  // Re-run on control change for snappier UX
+  ["pLeader", "pFollower", "pLag", "pThr", "pMode", "pYears"].forEach(id => {
+    document.getElementById(id).addEventListener("change", () => runPair().catch(() => {}));
+  });
 }
 
 boot();
