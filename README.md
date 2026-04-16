@@ -14,7 +14,9 @@ Press **Space** or click the play button to start. The orb expands and contracts
 
 ## Android APK
 
-A native Android wrapper lives in `android/`. Every push to `main` or a `claude/**` branch triggers the `Build Android APK` GitHub Actions workflow, which produces a debug APK as a downloadable artifact named `breathing-companion-debug`.
+A native Android wrapper lives in `android/`. Every push to `main` or a `claude/**` branch triggers the `Build Android APK` GitHub Actions workflow, which produces a debug APK as a downloadable artifact named `breathing-companion-debug` and republishes it to the rolling `snapshot` GitHub Release.
+
+**Direct APK download:** https://github.com/ttheman239-bot/Yk/releases/download/snapshot/breathing-companion.apk
 
 Local build (requires Android SDK + JDK 17):
 

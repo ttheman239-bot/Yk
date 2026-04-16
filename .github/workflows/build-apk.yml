@@ -14,6 +14,9 @@ on:
       - '.github/workflows/build-apk.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build debug APK
@@ -49,9 +52,33 @@ jobs:
         working-directory: android
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Upload APK
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/breathing-companion.apk
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: breathing-companion-debug
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: dist/breathing-companion.apk
           if-no-files-found: error
+
+      - name: Publish rolling release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: snapshot
+          name: Latest debug build
+          body: |
+            Debug build of Breathing Companion.
+
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Built: ${{ github.event.head_commit.timestamp }}
+
+            Direct download:
+            https://github.com/${{ github.repository }}/releases/download/snapshot/breathing-companion.apk
+          prerelease: true
+          make_latest: "false"
+          files: dist/breathing-companion.apk
