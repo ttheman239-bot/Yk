@@ -1,1 +1,2 @@
-node_modules/\ndata/*.db
+node_modules/
+data/
