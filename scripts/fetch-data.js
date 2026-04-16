@@ -90,17 +90,28 @@ function trimYears(rows, years) {
 (async () => {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const manifest = { generated: new Date().toISOString(), symbols: [] };
+  const debug = [];
+
+  // Network smoke test
+  for (const url of ["https://query1.finance.yahoo.com/", "https://stooq.com/"]) {
+    try {
+      const r = await fetch(url, { headers: { "User-Agent": UA } });
+      debug.push(`probe ${url} -> ${r.status}`);
+    } catch (e) { debug.push(`probe ${url} FAIL: ${e.message}`); }
+  }
 
   for (const sym of SYMBOLS) {
     const file = path.join(DATA_DIR, safeName(sym.id) + ".json");
-    let rows = null, source = null, lastErr = null;
+    let rows = null, source = null, lastErr = null, yErr = null, sErr = null;
     try { rows = trimYears(await fetchYahoo(sym.yahoo), YEARS_BACK); source = "yahoo"; }
-    catch (e) { lastErr = e; }
+    catch (e) { yErr = e; lastErr = e; }
 
     if (!rows) {
       try { rows = trimYears(await fetchStooq(sym.stooq), YEARS_BACK); source = "stooq"; }
-      catch (e2) { lastErr = e2; }
+      catch (e2) { sErr = e2; lastErr = e2; }
     }
+
+    debug.push(`${sym.id}: yahoo=${yErr ? "FAIL " + yErr.message : "ok"} | stooq=${sErr ? "FAIL " + sErr.message : rows ? (source === "stooq" ? "ok" : "skipped") : "n/a"}`);
 
     if (rows && rows.length >= 50) {
       const last = rows[rows.length - 1];
@@ -131,5 +142,7 @@ function trimYears(rows, years) {
   }
 
   fs.writeFileSync(path.join(DATA_DIR, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+  fs.writeFileSync(path.join(DATA_DIR, "debug.log"), debug.join("\n") + "\n");
   console.log(`\nDone: ${manifest.symbols.length}/${SYMBOLS.length} symbols in manifest.`);
+  console.log(debug.join("\n"));
 })().catch(e => { console.error("FATAL", e); process.exit(1); });
