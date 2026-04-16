@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.graphics.Color
 import android.os.Bundle
 import android.view.View
-import android.view.WindowManager
 import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
@@ -15,12 +14,11 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        window.statusBarColor = Color.parseColor("#0a0f1c")
-        window.navigationBarColor = Color.parseColor("#0a0f1c")
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.statusBarColor = Color.parseColor("#0b1020")
+        window.navigationBarColor = Color.parseColor("#0b1020")
 
         val webView = WebView(this).apply {
-            setBackgroundColor(Color.parseColor("#0a0f1c"))
+            setBackgroundColor(Color.parseColor("#0b1020"))
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true

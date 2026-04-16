@@ -3,366 +3,563 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Breathing Companion</title>
+<title>Market Clock & Arbitrage</title>
 <style>
   :root {
-    --bg-0: #0a0f1c;
-    --bg-1: #111a2e;
+    --bg: #0b1020;
+    --panel: #141b33;
+    --panel-2: #1b2446;
+    --text: #e8ecff;
+    --muted: #8592b8;
     --accent: #7ecbff;
-    --accent-soft: rgba(126, 203, 255, 0.18);
-    --text: #e8f1ff;
-    --muted: #8ea3c4;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --border: rgba(255, 255, 255, 0.08);
   }
-
   * { box-sizing: border-box; margin: 0; padding: 0; }
-
   html, body {
-    height: 100%;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
     color: var(--text);
-    background: radial-gradient(ellipse at top, var(--bg-1), var(--bg-0));
-    overflow: hidden;
+    min-height: 100%;
+    font-size: 14px;
   }
-
-  .app {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: space-between;
-    height: 100%;
-    padding: 2rem 1rem;
-  }
+  body { padding: 16px; padding-bottom: 64px; }
 
   header {
-    text-align: center;
-  }
-
-  h1 {
-    font-size: 1.25rem;
-    font-weight: 400;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-
-  .stage {
-    flex: 1;
     display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 2rem;
-    width: 100%;
-  }
-
-  .orb-wrap {
-    position: relative;
-    width: min(60vmin, 360px);
-    height: min(60vmin, 360px);
-    display: grid;
-    place-items: center;
-  }
-
-  .orb {
-    position: absolute;
-    inset: 0;
-    border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, var(--accent-soft), transparent 70%);
-    border: 1px solid var(--accent-soft);
-    transform: scale(0.5);
-    transition: transform linear;
-    box-shadow: 0 0 80px var(--accent-soft), inset 0 0 60px var(--accent-soft);
-  }
-
-  .orb.inhale { transform: scale(1); }
-  .orb.hold-in, .orb.hold-out { /* scale preserved from previous phase via JS */ }
-  .orb.exhale { transform: scale(0.5); }
-
-  .phase {
-    position: relative;
-    z-index: 2;
-    text-align: center;
-    pointer-events: none;
-  }
-
-  .phase .label {
-    font-size: 1.5rem;
-    font-weight: 300;
-    letter-spacing: 0.15em;
-    text-transform: uppercase;
-  }
-
-  .phase .count {
-    font-size: 3.5rem;
-    font-weight: 200;
-    font-variant-numeric: tabular-nums;
-    margin-top: 0.25rem;
-    color: var(--accent);
-  }
-
-  .patterns {
-    display: flex;
-    gap: 0.5rem;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 8px 4px 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
     flex-wrap: wrap;
-    justify-content: center;
+    gap: 8px;
   }
-
-  .patterns button {
-    background: transparent;
-    border: 1px solid var(--accent-soft);
-    color: var(--muted);
-    padding: 0.5rem 1rem;
-    border-radius: 999px;
-    cursor: pointer;
+  h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .local-time {
     font-size: 0.85rem;
-    letter-spacing: 0.05em;
-    transition: all 0.2s;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
   }
 
-  .patterns button:hover { color: var(--text); }
-  .patterns button.active {
-    background: var(--accent-soft);
-    color: var(--text);
-    border-color: var(--accent);
+  section { margin-bottom: 28px; }
+  h2 {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--muted);
+    margin-bottom: 10px;
+    padding-left: 4px;
   }
 
-  footer {
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 10px;
+  }
+
+  .market {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
     display: flex;
     flex-direction: column;
-    align-items: center;
-    gap: 1rem;
-    width: 100%;
+    gap: 6px;
   }
+  .market.open { border-left: 3px solid var(--green); }
+  .market.closed { border-left: 3px solid var(--red); }
+  .market.lunch { border-left: 3px solid var(--yellow); }
 
-  .controls {
+  .m-row {
     display: flex;
+    justify-content: space-between;
     align-items: center;
-    gap: 1.5rem;
   }
-
-  .play {
-    width: 64px;
-    height: 64px;
-    border-radius: 50%;
-    background: var(--accent);
-    border: none;
-    color: var(--bg-0);
-    font-size: 1.5rem;
-    cursor: pointer;
-    display: grid;
-    place-items: center;
-    transition: transform 0.2s, box-shadow 0.2s;
-    box-shadow: 0 8px 32px rgba(126, 203, 255, 0.3);
+  .m-name {
+    font-weight: 600;
+    font-size: 0.95rem;
   }
-
-  .play:hover { transform: scale(1.05); }
-  .play:active { transform: scale(0.95); }
-
-  .timer {
-    font-variant-numeric: tabular-nums;
-    font-size: 1rem;
-    color: var(--muted);
+  .m-flag { margin-right: 6px; }
+  .status {
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    text-transform: uppercase;
     letter-spacing: 0.1em;
-    min-width: 4ch;
-    text-align: center;
   }
+  .status.open { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+  .status.closed { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+  .status.lunch { background: rgba(251, 191, 36, 0.15); color: var(--yellow); }
 
-  .pattern-desc {
-    font-size: 0.85rem;
+  .m-sub {
+    font-size: 0.78rem;
     color: var(--muted);
-    text-align: center;
-    min-height: 1.2em;
+    display: flex;
+    justify-content: space-between;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-hours { font-size: 0.72rem; color: var(--muted); opacity: 0.7; }
+
+  .arb-table {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .arb-row {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr 1fr 0.8fr 32px;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    font-size: 0.85rem;
+  }
+  .arb-row:last-child { border-bottom: none; }
+  .arb-row.head {
+    background: var(--panel-2);
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .leg { display: flex; flex-direction: column; gap: 2px; }
+  .leg .sym { font-weight: 600; font-size: 0.8rem; }
+  .leg .px { font-variant-numeric: tabular-nums; }
+  .leg .st {
+    font-size: 0.65rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .leg .st.open { color: var(--green); }
+  .leg .st.closed { color: var(--red); }
+  .spread { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+  .spread.pos { color: var(--green); }
+  .spread.neg { color: var(--red); }
+  .del {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 1.2rem;
+    padding: 4px;
+  }
+  .del:hover { color: var(--red); }
+
+  .add-form {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr auto;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  input, select, button.primary {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.85rem;
+    font-family: inherit;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  button.primary {
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+    cursor: pointer;
+    border: none;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+
+  .refresh-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    padding: 0 4px;
+  }
+  .refresh-bar .last {
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .refresh {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .refresh:hover { background: var(--panel-2); }
+
+  .hint {
+    font-size: 0.72rem;
+    color: var(--muted);
+    padding: 8px 4px 0;
+    line-height: 1.5;
   }
 
-  @media (max-width: 480px) {
-    .phase .label { font-size: 1.1rem; }
-    .phase .count { font-size: 2.5rem; }
-    h1 { font-size: 1rem; }
+  @media (max-width: 560px) {
+    .arb-row {
+      grid-template-columns: 1fr 1fr 0.8fr 28px;
+      font-size: 0.78rem;
+    }
+    .arb-row .hide-sm { display: none; }
+    .add-form { grid-template-columns: 1fr 1fr; }
+    .add-form button { grid-column: 1 / -1; }
   }
 </style>
 </head>
 <body>
-  <div class="app">
-    <header>
-      <h1>Breathing Companion</h1>
-    </header>
 
-    <div class="stage">
-      <div class="patterns" id="patterns"></div>
-      <div class="pattern-desc" id="desc"></div>
+<header>
+  <h1>Market Clock &amp; Arbitrage</h1>
+  <div class="local-time" id="localTime">—</div>
+</header>
 
-      <div class="orb-wrap">
-        <div class="orb" id="orb"></div>
-        <div class="phase">
-          <div class="label" id="phaseLabel">Ready</div>
-          <div class="count" id="phaseCount">—</div>
-        </div>
-      </div>
-    </div>
+<section>
+  <h2>Stock exchanges</h2>
+  <div class="grid" id="markets"></div>
+</section>
 
-    <footer>
-      <div class="controls">
-        <div class="timer" id="timer">00:00</div>
-        <button class="play" id="playBtn" aria-label="Start">▶</button>
-        <div class="timer" id="cycles">0 cycles</div>
-      </div>
-    </footer>
+<section>
+  <h2>Dual-listed arbitrage</h2>
+  <div class="refresh-bar">
+    <div class="last" id="lastRefresh">Prices not loaded yet</div>
+    <button class="refresh" id="refreshBtn">Refresh prices</button>
   </div>
+  <div class="arb-table" id="arbTable"></div>
+  <div class="add-form">
+    <input id="addA" placeholder="Leg A (e.g. baba.us)" />
+    <input id="addB" placeholder="Leg B (e.g. 9988.hk)" />
+    <input id="addFx" placeholder="FX (e.g. usdhkd or blank)" />
+    <button class="primary" id="addBtn">Add pair</button>
+  </div>
+  <div class="hint">
+    Symbols use Stooq format: <code>aapl.us</code>, <code>9988.hk</code>, <code>7203.jp</code>, <code>ptt.th</code>, <code>bhp.au</code>, <code>2330.tw</code>, <code>hsbc.uk</code>.
+    FX ties the legs to a common currency — e.g. <code>usdhkd</code> makes Leg B (HKD) comparable to Leg A (USD). Leave blank when both legs share a currency.
+    Spread is <code>((B×FX) / A − 1) × 100%</code>; large gaps while one market is closed hint at overnight catch-up moves.
+  </div>
+</section>
 
 <script>
-  const PATTERNS = {
-    box: {
-      name: "Box 4-4-4-4",
-      desc: "Calm focus. Equal inhale, hold, exhale, hold.",
-      steps: [
-        { phase: "inhale", label: "Inhale", seconds: 4 },
-        { phase: "hold-in", label: "Hold", seconds: 4 },
-        { phase: "exhale", label: "Exhale", seconds: 4 },
-        { phase: "hold-out", label: "Hold", seconds: 4 },
-      ],
-    },
-    relax: {
-      name: "4-7-8",
-      desc: "Deep relaxation. Longer exhale releases tension.",
-      steps: [
-        { phase: "inhale", label: "Inhale", seconds: 4 },
-        { phase: "hold-in", label: "Hold", seconds: 7 },
-        { phase: "exhale", label: "Exhale", seconds: 8 },
-      ],
-    },
-    coherent: {
-      name: "Coherent 5-5",
-      desc: "Balanced heart rhythm. Five in, five out.",
-      steps: [
-        { phase: "inhale", label: "Inhale", seconds: 5 },
-        { phase: "exhale", label: "Exhale", seconds: 5 },
-      ],
-    },
+const MARKETS = [
+  { name: "NYSE",       flag: "🇺🇸", tz: "America/New_York",   sessions: [["09:30","16:00"]], days: [1,2,3,4,5] },
+  { name: "NASDAQ",     flag: "🇺🇸", tz: "America/New_York",   sessions: [["09:30","16:00"]], days: [1,2,3,4,5] },
+  { name: "TSX",        flag: "🇨🇦", tz: "America/Toronto",    sessions: [["09:30","16:00"]], days: [1,2,3,4,5] },
+  { name: "B3",         flag: "🇧🇷", tz: "America/Sao_Paulo",  sessions: [["10:00","17:55"]], days: [1,2,3,4,5] },
+  { name: "LSE",        flag: "🇬🇧", tz: "Europe/London",      sessions: [["08:00","16:30"]], days: [1,2,3,4,5] },
+  { name: "Euronext",   flag: "🇫🇷", tz: "Europe/Paris",       sessions: [["09:00","17:30"]], days: [1,2,3,4,5] },
+  { name: "Xetra",      flag: "🇩🇪", tz: "Europe/Berlin",      sessions: [["09:00","17:30"]], days: [1,2,3,4,5] },
+  { name: "SIX",        flag: "🇨🇭", tz: "Europe/Zurich",      sessions: [["09:00","17:30"]], days: [1,2,3,4,5] },
+  { name: "MOEX",       flag: "🇷🇺", tz: "Europe/Moscow",      sessions: [["09:50","18:50"]], days: [1,2,3,4,5] },
+  { name: "JSE",        flag: "🇿🇦", tz: "Africa/Johannesburg",sessions: [["09:00","17:00"]], days: [1,2,3,4,5] },
+  { name: "NSE India",  flag: "🇮🇳", tz: "Asia/Kolkata",       sessions: [["09:15","15:30"]], days: [1,2,3,4,5] },
+  { name: "SET",        flag: "🇹🇭", tz: "Asia/Bangkok",       sessions: [["10:00","12:30"],["14:30","16:30"]], days: [1,2,3,4,5] },
+  { name: "SGX",        flag: "🇸🇬", tz: "Asia/Singapore",     sessions: [["09:00","12:00"],["13:00","17:00"]], days: [1,2,3,4,5] },
+  { name: "HKEX",       flag: "🇭🇰", tz: "Asia/Hong_Kong",     sessions: [["09:30","12:00"],["13:00","16:00"]], days: [1,2,3,4,5] },
+  { name: "SSE",        flag: "🇨🇳", tz: "Asia/Shanghai",      sessions: [["09:30","11:30"],["13:00","15:00"]], days: [1,2,3,4,5] },
+  { name: "TWSE",       flag: "🇹🇼", tz: "Asia/Taipei",        sessions: [["09:00","13:30"]], days: [1,2,3,4,5] },
+  { name: "KRX",        flag: "🇰🇷", tz: "Asia/Seoul",         sessions: [["09:00","15:30"]], days: [1,2,3,4,5] },
+  { name: "TSE Tokyo",  flag: "🇯🇵", tz: "Asia/Tokyo",         sessions: [["09:00","11:30"],["12:30","15:00"]], days: [1,2,3,4,5] },
+  { name: "ASX",        flag: "🇦🇺", tz: "Australia/Sydney",   sessions: [["10:00","16:00"]], days: [1,2,3,4,5] },
+  { name: "NZX",        flag: "🇳🇿", tz: "Pacific/Auckland",   sessions: [["10:00","16:45"]], days: [1,2,3,4,5] },
+];
+
+const DEFAULT_PAIRS = [
+  { a: "baba.us", b: "9988.hk", fx: "usdhkd" },
+  { a: "tsm.us",  b: "2330.tw", fx: "usdtwd" },
+  { a: "tm.us",   b: "7203.jp", fx: "usdjpy" },
+  { a: "bhp.us",  b: "bhp.au",  fx: "usdaud" },
+  { a: "rio.us",  b: "rio.uk",  fx: "usdgbp" },
+];
+
+const STORAGE_KEY = "arb.pairs.v1";
+
+function loadPairs() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [...DEFAULT_PAIRS];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+  } catch (_) {}
+  return [...DEFAULT_PAIRS];
+}
+function savePairs(pairs) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs)); } catch (_) {}
+}
+
+let pairs = loadPairs();
+
+function parseHM(hm) {
+  const [h, m] = hm.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function zonedParts(date, tz) {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    hour12: false,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(date).map(p => [p.type, p.value]));
+  const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  let hour = parseInt(parts.hour, 10);
+  if (hour === 24) hour = 0;
+  const minute = parseInt(parts.minute, 10);
+  const second = parseInt(parts.second, 10);
+  return {
+    weekday: weekdayMap[parts.weekday],
+    hour, minute, second,
+    minutesOfDay: hour * 60 + minute,
+    hms: `${String(hour).padStart(2,"0")}:${String(minute).padStart(2,"0")}:${String(second).padStart(2,"0")}`,
   };
+}
 
-  const orb = document.getElementById("orb");
-  const phaseLabel = document.getElementById("phaseLabel");
-  const phaseCount = document.getElementById("phaseCount");
-  const playBtn = document.getElementById("playBtn");
-  const timerEl = document.getElementById("timer");
-  const cyclesEl = document.getElementById("cycles");
-  const patternsEl = document.getElementById("patterns");
-  const descEl = document.getElementById("desc");
+function computeMarketStatus(market, now) {
+  const z = zonedParts(now, market.tz);
+  const today = market.days.includes(z.weekday);
+  const m = z.minutesOfDay;
 
-  let current = "box";
-  let running = false;
-  let stepIndex = 0;
-  let secondsLeft = 0;
-  let tickHandle = null;
-  let sessionStart = 0;
-  let cycleCount = 0;
+  let status = "closed";
+  let next = null;
 
-  function renderPatterns() {
-    patternsEl.innerHTML = "";
-    for (const [key, p] of Object.entries(PATTERNS)) {
-      const btn = document.createElement("button");
-      btn.textContent = p.name;
-      btn.className = key === current ? "active" : "";
-      btn.addEventListener("click", () => {
-        current = key;
-        reset();
-        renderPatterns();
-        descEl.textContent = PATTERNS[current].desc;
-      });
-      patternsEl.appendChild(btn);
-    }
-    descEl.textContent = PATTERNS[current].desc;
-  }
-
-  function formatTime(ms) {
-    const s = Math.floor(ms / 1000);
-    const m = Math.floor(s / 60);
-    const r = s % 60;
-    return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-  }
-
-  function applyPhase(step) {
-    orb.classList.remove("inhale", "hold-in", "hold-out", "exhale");
-    orb.style.transitionDuration = step.seconds + "s";
-    orb.classList.add(step.phase);
-    phaseLabel.textContent = step.label;
-  }
-
-  function reset() {
-    running = false;
-    clearInterval(tickHandle);
-    tickHandle = null;
-    stepIndex = 0;
-    secondsLeft = 0;
-    cycleCount = 0;
-    playBtn.textContent = "▶";
-    phaseLabel.textContent = "Ready";
-    phaseCount.textContent = "—";
-    timerEl.textContent = "00:00";
-    cyclesEl.textContent = "0 cycles";
-    orb.classList.remove("inhale", "hold-in", "hold-out", "exhale");
-    orb.style.transitionDuration = "0.8s";
-  }
-
-  function nextStep() {
-    const pattern = PATTERNS[current];
-    const step = pattern.steps[stepIndex];
-    applyPhase(step);
-    secondsLeft = step.seconds;
-    phaseCount.textContent = secondsLeft;
-  }
-
-  function tick() {
-    if (!running) return;
-    const pattern = PATTERNS[current];
-    timerEl.textContent = formatTime(Date.now() - sessionStart);
-
-    secondsLeft -= 1;
-    if (secondsLeft <= 0) {
-      stepIndex = (stepIndex + 1) % pattern.steps.length;
-      if (stepIndex === 0) {
-        cycleCount += 1;
-        cyclesEl.textContent = `${cycleCount} cycle${cycleCount === 1 ? "" : "s"}`;
+  if (today) {
+    for (const [open, close] of market.sessions) {
+      const o = parseHM(open), c = parseHM(close);
+      if (m >= o && m < c) {
+        status = "open";
+        next = { kind: "close", mins: c - m };
+        break;
       }
-      nextStep();
+    }
+    if (status === "closed") {
+      for (const [open] of market.sessions) {
+        const o = parseHM(open);
+        if (m < o) {
+          const prevSessionEnded = market.sessions.some(([, c]) => m >= parseHM(c) && parseHM(c) <= o);
+          status = prevSessionEnded ? "lunch" : "closed";
+          next = { kind: "open", mins: o - m };
+          break;
+        }
+      }
+    }
+  }
+
+  if (!next) {
+    let add = 0;
+    let wd = z.weekday;
+    if (today) {
+      add = 24 * 60 - m;
+      wd = (wd + 1) % 7;
     } else {
-      phaseCount.textContent = secondsLeft;
+      add = 24 * 60 - m;
+      wd = (wd + 1) % 7;
     }
-  }
-
-  function start() {
-    running = true;
-    playBtn.textContent = "❚❚";
-    sessionStart = Date.now() - (() => {
-      const [m, s] = timerEl.textContent.split(":").map(Number);
-      return (m * 60 + s) * 1000;
-    })();
-    nextStep();
-    tickHandle = setInterval(tick, 1000);
-  }
-
-  function pause() {
-    running = false;
-    clearInterval(tickHandle);
-    tickHandle = null;
-    playBtn.textContent = "▶";
-  }
-
-  playBtn.addEventListener("click", () => {
-    if (running) pause();
-    else start();
-  });
-
-  document.addEventListener("keydown", (e) => {
-    if (e.code === "Space") {
-      e.preventDefault();
-      playBtn.click();
+    while (!market.days.includes(wd)) {
+      add += 24 * 60;
+      wd = (wd + 1) % 7;
     }
-  });
+    const firstOpen = parseHM(market.sessions[0][0]);
+    next = { kind: "open", mins: add + firstOpen };
+  }
 
-  renderPatterns();
-  reset();
+  return { status, next, local: z.hms };
+}
+
+function fmtDuration(mins) {
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  if (h < 24) return `${h}h ${m}m`;
+  const d = Math.floor(h / 24);
+  const rh = h % 24;
+  return `${d}d ${rh}h`;
+}
+
+function renderMarkets() {
+  const now = new Date();
+  const container = document.getElementById("markets");
+  const rows = MARKETS.map(mk => {
+    const { status, next, local } = computeMarketStatus(mk, now);
+    const hoursDesc = mk.sessions.map(s => `${s[0]}–${s[1]}`).join(" · ");
+    return `
+      <div class="market ${status}">
+        <div class="m-row">
+          <div class="m-name"><span class="m-flag">${mk.flag}</span>${mk.name}</div>
+          <div class="status ${status}">${status}</div>
+        </div>
+        <div class="m-sub">
+          <span>${local} ${mk.tz.split("/").pop().replace("_"," ")}</span>
+          <span>${next.kind === "open" ? "opens in" : "closes in"} ${fmtDuration(next.mins)}</span>
+        </div>
+        <div class="m-hours">${hoursDesc}</div>
+      </div>`;
+  }).join("");
+  container.innerHTML = rows;
+}
+
+function renderLocalTime() {
+  const now = new Date();
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const t = now.toLocaleTimeString([], { hour12: false });
+  document.getElementById("localTime").textContent = `${t} · ${tz}`;
+}
+
+function marketForSymbol(sym) {
+  const suffix = sym.split(".").pop().toLowerCase();
+  const map = {
+    us: ["NYSE","NASDAQ"], ca: ["TSX"], br: ["B3"], uk: ["LSE"],
+    fr: ["Euronext"], de: ["Xetra"], ch: ["SIX"], ru: ["MOEX"],
+    in: ["NSE India"], th: ["SET"], sg: ["SGX"], hk: ["HKEX"],
+    cn: ["SSE"], tw: ["TWSE"], kr: ["KRX"], jp: ["TSE Tokyo"],
+    au: ["ASX"], nz: ["NZX"], za: ["JSE"],
+  };
+  const names = map[suffix] || [];
+  for (const n of names) {
+    const m = MARKETS.find(x => x.name === n);
+    if (m) return m;
+  }
+  return null;
+}
+
+async function fetchStooq(sym) {
+  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlc&h&e=csv`;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    const text = await res.text();
+    const lines = text.trim().split("\n");
+    if (lines.length < 2) return null;
+    const header = lines[0].split(",");
+    const row = lines[1].split(",");
+    const obj = Object.fromEntries(header.map((h, i) => [h.toLowerCase(), row[i]]));
+    const close = parseFloat(obj.close);
+    if (!isFinite(close)) return null;
+    return { close, date: obj.date, time: obj.time };
+  } catch (_) {
+    return null;
+  }
+}
+
+function renderArbTable() {
+  const table = document.getElementById("arbTable");
+  const now = new Date();
+  const head = `
+    <div class="arb-row head">
+      <div>Leg A</div>
+      <div>Leg B</div>
+      <div class="hide-sm">FX</div>
+      <div style="text-align:right">Spread</div>
+      <div></div>
+    </div>`;
+  const rows = pairs.map((p, idx) => {
+    const mA = marketForSymbol(p.a);
+    const mB = marketForSymbol(p.b);
+    const stA = mA ? computeMarketStatus(mA, now).status : "unknown";
+    const stB = mB ? computeMarketStatus(mB, now).status : "unknown";
+    const pA = p.priceA != null ? p.priceA.toFixed(4) : "—";
+    const pB = p.priceB != null ? p.priceB.toFixed(4) : "—";
+    const fxV = p.priceFx != null ? p.priceFx.toFixed(4) : (p.fx ? "—" : "1.0000");
+    let spreadTxt = "—", spreadCls = "";
+    if (p.priceA != null && p.priceB != null) {
+      const fx = p.fx ? (p.priceFx != null ? p.priceFx : null) : 1;
+      if (fx != null) {
+        const pct = ((p.priceB * fx) / p.priceA - 1) * 100;
+        spreadTxt = (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
+        spreadCls = pct >= 0 ? "pos" : "neg";
+      }
+    }
+    return `
+      <div class="arb-row">
+        <div class="leg">
+          <span class="sym">${p.a}</span>
+          <span class="px">${pA}</span>
+          <span class="st ${stA}">${stA}</span>
+        </div>
+        <div class="leg">
+          <span class="sym">${p.b}</span>
+          <span class="px">${pB}</span>
+          <span class="st ${stB}">${stB}</span>
+        </div>
+        <div class="leg hide-sm">
+          <span class="sym">${p.fx || "—"}</span>
+          <span class="px">${fxV}</span>
+        </div>
+        <div class="spread ${spreadCls}">${spreadTxt}</div>
+        <button class="del" data-idx="${idx}" title="Remove">×</button>
+      </div>`;
+  }).join("");
+  table.innerHTML = head + (rows || `<div class="arb-row"><div style="color:var(--muted)">No pairs yet.</div></div>`);
+  table.querySelectorAll(".del").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = parseInt(btn.dataset.idx, 10);
+      pairs.splice(i, 1);
+      savePairs(pairs);
+      renderArbTable();
+    });
+  });
+}
+
+async function refreshPrices() {
+  const btn = document.getElementById("refreshBtn");
+  const last = document.getElementById("lastRefresh");
+  btn.disabled = true;
+  btn.textContent = "Loading…";
+  const tasks = [];
+  for (const p of pairs) {
+    tasks.push(fetchStooq(p.a).then(r => { p.priceA = r ? r.close : null; }));
+    tasks.push(fetchStooq(p.b).then(r => { p.priceB = r ? r.close : null; }));
+    if (p.fx) tasks.push(fetchStooq(p.fx).then(r => { p.priceFx = r ? r.close : null; }));
+  }
+  await Promise.all(tasks);
+  renderArbTable();
+  last.textContent = "Last refresh " + new Date().toLocaleTimeString([], { hour12: false });
+  btn.disabled = false;
+  btn.textContent = "Refresh prices";
+}
+
+document.getElementById("refreshBtn").addEventListener("click", refreshPrices);
+document.getElementById("addBtn").addEventListener("click", () => {
+  const a = document.getElementById("addA").value.trim().toLowerCase();
+  const b = document.getElementById("addB").value.trim().toLowerCase();
+  const fx = document.getElementById("addFx").value.trim().toLowerCase();
+  if (!a || !b) return;
+  pairs.push({ a, b, fx: fx || null });
+  savePairs(pairs);
+  document.getElementById("addA").value = "";
+  document.getElementById("addB").value = "";
+  document.getElementById("addFx").value = "";
+  renderArbTable();
+});
+
+function tick() {
+  renderLocalTime();
+  renderMarkets();
+}
+tick();
+setInterval(tick, 1000);
+
+renderArbTable();
+refreshPrices();
+setInterval(refreshPrices, 60_000);
 </script>
 </body>
 </html>
