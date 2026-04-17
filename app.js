@@ -146,43 +146,75 @@ function retOf(p, mode) {
   return mode === "oc" ? p.rF_oc : mode === "co" ? p.rF_co : p.rF_cc;
 }
 
-// Backtest: on each day where |rL| > thr, take position sign(rL) in follower.
-function backtest(pairs, thr, mode) {
-  const equity = [{ d: pairs[0]?.dL || "", v: 1 }];
-  const drawdowns = [];
-  let peak = 1;
+// Asymmetric backtest with transaction costs.
+// For each row, trade side is determined by `signals[i]` vs asymmetric thresholds:
+//   signal >= thrUp → long,  signal <= -thrDn → short,  else flat.
+// `costBps` is deducted each time we open AND close (i.e. 2×cost per round trip).
+function backtestEx(rows, signals, mode, opts) {
+  const thrUp = Math.max(0, (opts && opts.thrUp) || 0);
+  const thrDn = Math.max(0, (opts && opts.thrDn) || 0);
+  const costBps = Math.max(0, (opts && opts.costBps) || 0);
+  const cost = costBps / 1e4;
+  const equity = [{ d: "", v: 1 }];
+  let peak = 1, maxDD = 0;
   let hits = 0, trades = 0, sumRet = 0, sumRet2 = 0;
   const upRets = [], dnRets = [];
-  for (const p of pairs) {
-    const rF = retOf(p, mode);
-    let dayRet = 0;
-    if (Math.abs(p.rL) >= thr) {
-      const side = p.rL > 0 ? 1 : -1;
-      dayRet = side * rF;
+  for (let i = 0; i < rows.length; i++) {
+    const rF = retOf(rows[i], mode);
+    const s = signals[i];
+    let dayRet = 0, side = 0;
+    if (s > 0 && s >= thrUp) side = +1;
+    else if (s < 0 && -s >= thrDn) side = -1;
+    if (side !== 0) {
+      dayRet = side * rF - 2 * cost;
       trades++;
-      if ((p.rL > 0 && rF > 0) || (p.rL < 0 && rF < 0)) hits++;
-      if (p.rL > 0) upRets.push(rF); else dnRets.push(rF);
+      if ((side > 0 && rF > 0) || (side < 0 && rF < 0)) hits++;
+      if (side > 0) upRets.push(rF); else dnRets.push(rF);
       sumRet += dayRet;
       sumRet2 += dayRet * dayRet;
     }
-    const last = equity[equity.length - 1].v;
-    const newV = last * (1 + dayRet);
-    equity.push({ d: p.dF, v: newV });
-    if (newV > peak) peak = newV;
-    drawdowns.push((newV - peak) / peak);
+    const v = equity[equity.length - 1].v * (1 + dayRet);
+    equity.push({ d: rows[i].dF || rows[i].dL || "", v });
+    if (v > peak) peak = v;
+    maxDD = Math.min(maxDD, (v - peak) / peak);
   }
-  const avgRet = trades ? sumRet / trades : 0;
-  const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avgRet * avgRet) : 0;
-  const sharpe = std > 0 ? (avgRet / std) * Math.sqrt(252) : 0;
-  const maxDD = drawdowns.length ? Math.min(...drawdowns) : 0;
+  const avg = trades ? sumRet / trades : 0;
+  const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avg * avg) : 0;
+  const sharpe = std > 0 ? (avg / std) * Math.sqrt(252) : 0;
   return {
-    equity, trades, drawdowns, maxDD,
-    hitRate: trades ? hits / trades : 0,
-    avgRet, sharpe,
-    upMean: mean(upRets), upN: upRets.length,
-    dnMean: mean(dnRets), dnN: dnRets.length,
+    equity, trades, hitRate: trades ? hits / trades : 0,
+    avgRet: avg, sharpe, maxDD,
+    upMean: upRets.length ? upRets.reduce((s, v) => s + v, 0) / upRets.length : 0, upN: upRets.length,
+    dnMean: dnRets.length ? dnRets.reduce((s, v) => s + v, 0) / dnRets.length : 0, dnN: dnRets.length,
     finalV: equity[equity.length - 1].v,
   };
+}
+
+// Scan thresholds 0–3% to find the best symmetric and asymmetric cutoffs.
+function scanThresholds(rows, signals, mode, costBps) {
+  const step = 0.001, max = 0.03;
+  const curve = [];
+  for (let t = 0; t <= max + 1e-9; t += step) {
+    const bt = backtestEx(rows, signals, mode, { thrUp: t, thrDn: t, costBps });
+    curve.push({ t, sharpe: bt.sharpe, hit: bt.hitRate, n: bt.trades, finalV: bt.finalV });
+  }
+  let bestSym = curve[0];
+  for (const r of curve) if (r.n >= 30 && r.sharpe > bestSym.sharpe) bestSym = r;
+  const grid = [0, 0.002, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03];
+  let bestAsym = null;
+  for (const u of grid) for (const d of grid) {
+    const bt = backtestEx(rows, signals, mode, { thrUp: u, thrDn: d, costBps });
+    if (bt.trades < 30) continue;
+    if (!bestAsym || bt.sharpe > bestAsym.sharpe) bestAsym = { up: u, dn: d, ...bt };
+  }
+  return { curve, bestSym, bestAsym };
+}
+
+// Legacy wrapper used by Pair tab.
+function backtest(pairs, thr, mode) {
+  const signals = pairs.map(p => p.rL);
+  const rows = pairs.map(p => ({ dF: p.dF, rF_cc: p.rF_cc, rF_oc: p.rF_oc, rF_co: p.rF_co }));
+  return backtestEx(rows, signals, mode, { thrUp: thr, thrDn: thr });
 }
 
 function fmtPct(x, dig = 2) { return (x * 100).toFixed(dig) + "%"; }
@@ -249,9 +281,14 @@ async function runPair() {
   const leaderId = document.getElementById("pLeader").value;
   const follId = document.getElementById("pFollower").value;
   const lag = Math.max(1, parseInt(document.getElementById("pLag").value) || 1);
-  const thr = Math.abs(parseFloat(document.getElementById("pThr").value) || 0) / 100;
+  const thrRawUp = parseFloat(document.getElementById("pThrUp").value);
+  const thrRawDn = parseFloat(document.getElementById("pThrDn").value);
+  const filterMode = document.getElementById("pFilter").value; // "abs" | "pct" | "auto"
+  const thrPctUp = parseFloat(document.getElementById("pThrUp").value) || 0;
+  const thrPctDn = parseFloat(document.getElementById("pThrDn").value) || 0;
   const mode = document.getElementById("pMode").value;
   const years = Math.max(1, parseFloat(document.getElementById("pYears").value) || 5);
+  const costBps = Math.max(0, parseFloat(document.getElementById("pCost").value) || 0);
   try {
     const [L, F] = await Promise.all([loadSeries(leaderId, years), loadSeries(follId, years)]);
     if (!L.rows.length || !F.rows.length) throw new Error("Empty series");
@@ -260,7 +297,25 @@ async function runPair() {
     const xs = pairs.map(p => p.rL);
     const ys = pairs.map(p => modeRet(p, mode));
     const reg = regress(xs, ys);
-    const bt = backtest(pairs, thr, mode);
+
+    // Compute thresholds from filter mode.
+    let thrUp = 0, thrDn = 0, thrLabel = "";
+    if (filterMode === "abs") {
+      thrUp = Math.abs(isFinite(thrRawUp) ? thrRawUp : 0) / 100;
+      thrDn = Math.abs(isFinite(thrRawDn) ? thrRawDn : thrRawUp || 0) / 100;
+      thrLabel = `abs: up≥${fmtPct(thrUp, 2)}, dn≤−${fmtPct(thrDn, 2)}`;
+    } else if (filterMode === "pct") {
+      const t = percentileThresholds(xs, Math.abs(thrPctUp) || 20);
+      thrUp = t.thrUp; thrDn = t.thrDn;
+      thrLabel = `top/bot ${Math.abs(thrPctUp) || 20}% (up≥${fmtPct(thrUp, 2)}, dn≤−${fmtPct(thrDn, 2)})`;
+    } else {
+      // auto: run scan and pick best asymmetric
+      const sc = scanThresholds(pairs, xs, mode, costBps);
+      if (sc.bestAsym) { thrUp = sc.bestAsym.up; thrDn = sc.bestAsym.dn; }
+      thrLabel = `auto (up≥${fmtPct(thrUp, 2)}, dn≤−${fmtPct(thrDn, 2)})`;
+    }
+    const bt = backtestEx(pairs, xs, mode, { thrUp, thrDn, costBps });
+    const scan = scanThresholds(pairs, xs, mode, costBps);
 
     const latest = pairs[pairs.length - 1];
     const latestL = latest.rL;
@@ -268,13 +323,13 @@ async function runPair() {
     const dir = predF >= 0 ? "up" : "dn";
     const dirTxt = predF >= 0 ? "ขึ้น" : "ลง";
 
-    // Lag scan: lags 1..5
+    // Lag scan: lags 1..5, using current thresholds + cost.
     const lagRows = [];
     for (let k = 1; k <= 5; k++) {
       const pp = alignSeries(L, F, k);
       if (pp.length < 30) { lagRows.push({ k, skipped: true }); continue; }
       const rg = regress(pp.map(p => p.rL), pp.map(p => modeRet(p, mode)));
-      const b = backtest(pp, thr, mode);
+      const b = backtestEx(pp, pp.map(p => p.rL), mode, { thrUp, thrDn, costBps });
       lagRows.push({ k, corr: rg.corr, t: rg.t, hit: b.hitRate, sharpe: b.sharpe, finalV: b.finalV, trades: b.trades });
     }
     const lagTable = `
@@ -295,7 +350,7 @@ async function runPair() {
       </div>`;
 
     // Recent signals (last 15 days where signal would have fired)
-    const recent = pairs.slice(-40).filter(p => Math.abs(p.rL) >= thr).slice(-15);
+    const recent = pairs.slice(-40).filter(p => (p.rL > 0 && p.rL >= thrUp) || (p.rL < 0 && -p.rL >= thrDn)).slice(-15);
     const recentRows = recent.map(p => {
       const rF = modeRet(p, mode);
       const pred = reg.a + reg.b * p.rL;
@@ -317,9 +372,14 @@ async function runPair() {
         </table></div>
       </div>`;
 
+    // Threshold-scan curve (Sharpe vs symmetric threshold)
+    const scanPts = scan.curve.map(r => ({ v: r.sharpe }));
+    const bestSymStr = scan.bestSym ? `Sharpe ${fmtNum(scan.bestSym.sharpe, 2)} @ ${fmtPct(scan.bestSym.t, 1)} (N=${scan.bestSym.n})` : "—";
+    const bestAsymStr = scan.bestAsym ? `Sharpe ${fmtNum(scan.bestAsym.sharpe, 2)} @ up≥${fmtPct(scan.bestAsym.up, 1)}, dn≤−${fmtPct(scan.bestAsym.dn, 1)} (N=${scan.bestAsym.trades})` : "—";
+
     out.innerHTML = `
       <div class="signal">
-        <div class="h">Current signal · ${MODE_LABEL[mode]} · lag ${lag}</div>
+        <div class="h">Current signal · ${MODE_LABEL[mode]} · lag ${lag} · filter: ${thrLabel} · cost ${costBps}bps</div>
         <div class="b">
           ${L.name} ${latest.dL}: <span class="em ${latestL >= 0 ? "up" : "dn"}">${fmtPct(latestL)}</span>
           → คาดว่า ${F.name} ${latest.dF}
@@ -341,6 +401,13 @@ async function runPair() {
       </div>
 
       <div class="chart"><h3>Equity curve (signal-only)</h3>${svgLine(bt.equity, 320, 120, "#4ade80")}</div>
+      <div class="chart"><h3>Threshold scan · Sharpe vs symmetric threshold (0–3%)</h3>
+        ${svgLine(scanPts, 320, 100, "#fbbf24")}
+        <div style="font-size:.72rem;color:var(--muted);margin-top:6px;line-height:1.5">
+          Best symmetric: <span style="color:var(--text)">${bestSymStr}</span><br>
+          Best asymmetric: <span style="color:var(--text)">${bestAsymStr}</span>
+        </div>
+      </div>
       ${lagTable}
       ${recentTable}
       <div class="chart"><h3>Scatter: leader vs follower (${MODE_LABEL[mode]})</h3>${svgScatter(pairs, mode, reg, 320, 180)}</div>
@@ -391,36 +458,14 @@ function alignMulti(follower, leaders, lag) {
   return out;
 }
 
-// Compute backtest stats for an arbitrary predicted-signal array (one per row).
-function backtestSignal(rows, predictions, mode, thr) {
-  const equity = [{ d: "", v: 1 }];
-  let peak = 1, maxDD = 0;
-  let hits = 0, trades = 0, sumRet = 0, sumRet2 = 0;
-  for (let i = 0; i < rows.length; i++) {
-    const rF = mode === "oc" ? rows[i].rF_oc : mode === "co" ? rows[i].rF_co : rows[i].rF_cc;
-    const pred = predictions[i];
-    let dayRet = 0;
-    if (Math.abs(pred) >= thr) {
-      const side = pred > 0 ? 1 : -1;
-      dayRet = side * rF;
-      trades++;
-      if ((pred > 0 && rF > 0) || (pred < 0 && rF < 0)) hits++;
-      sumRet += dayRet;
-      sumRet2 += dayRet * dayRet;
-    }
-    const v = equity[equity.length - 1].v * (1 + dayRet);
-    equity.push({ d: rows[i].dF, v });
-    if (v > peak) peak = v;
-    maxDD = Math.min(maxDD, (v - peak) / peak);
-  }
-  const avg = trades ? sumRet / trades : 0;
-  const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avg * avg) : 0;
-  const sharpe = std > 0 ? (avg / std) * Math.sqrt(252) : 0;
-  return {
-    equity, trades, hitRate: trades ? hits / trades : 0,
-    avgRet: avg, sharpe, maxDD,
-    finalV: equity[equity.length - 1].v,
-  };
+// Convert a percentile (0–100) of |signal| into a raw threshold that
+// triggers trades only on the top N% (upper side) and bottom N% (lower side).
+function percentileThresholds(signals, pct) {
+  if (!pct || pct <= 0 || pct >= 100) return { thrUp: 0, thrDn: 0 };
+  const ups = signals.filter(s => s > 0).sort((a, b) => a - b);
+  const dns = signals.filter(s => s < 0).map(s => -s).sort((a, b) => a - b);
+  const q = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor((p / 100) * arr.length))] : 0;
+  return { thrUp: q(ups, 100 - pct), thrDn: q(dns, 100 - pct) };
 }
 
 async function runSearch() {
@@ -432,6 +477,7 @@ async function runSearch() {
   const mode = document.getElementById("xMode").value;
   const thr = Math.abs(parseFloat(document.getElementById("xThr").value) || 0) / 100;
   const years = Math.max(1, parseFloat(document.getElementById("xYears").value) || 5);
+  const costBps = Math.max(0, parseFloat(document.getElementById("xCost").value) || 0);
   try {
     const F = await loadSeries(followerId, years);
     const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
@@ -457,13 +503,20 @@ async function runSearch() {
         // In-sample and OOS predictions.
         const predIn = fit.pred;
         const predOut = Xtest.map(row => row.reduce((s, v, i) => s + v * fit.beta[i], 0));
-        const btIn = backtestSignal(aligned.slice(0, split), predIn, mode, thr);
-        const btOut = backtestSignal(aligned.slice(split), predOut, mode, thr);
+        // Tune threshold on TRAIN set, then apply to OOS — no look-ahead.
+        let tunedUp = thr, tunedDn = thr;
+        if (thr === 0) {
+          const tune = scanThresholds(aligned.slice(0, split), predIn, mode, costBps);
+          if (tune.bestAsym) { tunedUp = tune.bestAsym.up; tunedDn = tune.bestAsym.dn; }
+        }
+        const btIn = backtestEx(aligned.slice(0, split), predIn, mode, { thrUp: tunedUp, thrDn: tunedDn, costBps });
+        const btOut = backtestEx(aligned.slice(split), predOut, mode, { thrUp: tunedUp, thrDn: tunedDn, costBps });
         results.push({
           combo, k,
           adjR2: fit.adjR2,
           r2: fit.r2,
           beta: fit.beta,
+          thrUp: tunedUp, thrDn: tunedDn,
           insSharpe: btIn.sharpe, insHit: btIn.hitRate, insEq: btIn.finalV, insN: btIn.trades,
           oosSharpe: btOut.sharpe, oosHit: btOut.hitRate, oosEq: btOut.finalV, oosN: btOut.trades,
           oosMaxDD: btOut.maxDD,
@@ -481,6 +534,7 @@ async function runSearch() {
     const best = top[0];
     const bestLabel = best.combo.map(nameOf).join(" + ");
     const betaInfo = best.combo.map((id, i) => `${nameOf(id)}: ${best.beta[i + 1].toFixed(3)}`).join(", ");
+    const thrInfo = `up≥${fmtPct(best.thrUp, 2)}, dn≤−${fmtPct(best.thrDn, 2)}`;
 
     const tbody = top.map((r, i) => `
       <tr${i === 0 ? ' style="background:var(--panel-2)"' : ''}>
@@ -512,6 +566,7 @@ async function runSearch() {
           equity <span class="em ${best.oosEq >= 1 ? "up" : "dn"}">${fmtNum(best.oosEq, 2)}×</span> ·
           adj R² ${fmtNum(best.adjR2, 3)}
           <div style="font-size:.72rem;color:var(--muted);margin-top:6px">β = ${betaInfo}</div>
+          <div style="font-size:.72rem;color:var(--muted);margin-top:2px">Tuned thresholds (train-only): ${thrInfo} · cost ${costBps}bps</div>
         </div>
       </div>
 
@@ -625,8 +680,9 @@ async function boot() {
   document.getElementById("sGo").addEventListener("click", runScreener);
   document.getElementById("xGo").addEventListener("click", runSearch);
   // Re-run on control change for snappier UX
-  ["pLeader", "pFollower", "pLag", "pThr", "pMode", "pYears"].forEach(id => {
-    document.getElementById(id).addEventListener("change", () => runPair().catch(() => {}));
+  ["pLeader", "pFollower", "pLag", "pThrUp", "pThrDn", "pFilter", "pMode", "pCost", "pYears"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", () => runPair().catch(() => {}));
   });
 }
 
