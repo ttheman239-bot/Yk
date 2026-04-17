@@ -146,30 +146,34 @@ function retOf(p, mode) {
   return mode === "oc" ? p.rF_oc : mode === "co" ? p.rF_co : p.rF_cc;
 }
 
-// Asymmetric backtest with transaction costs.
-// For each row, trade side is determined by `signals[i]` vs asymmetric thresholds:
-//   signal >= thrUp → long,  signal <= -thrDn → short,  else flat.
-// `costBps` is deducted each time we open AND close (i.e. 2×cost per round trip).
+// Asymmetric backtest with transaction costs + direction filter.
+// direction: "both" (default), "long" (skip short signals), "short" (skip longs).
 function backtestEx(rows, signals, mode, opts) {
   const thrUp = Math.max(0, (opts && opts.thrUp) || 0);
   const thrDn = Math.max(0, (opts && opts.thrDn) || 0);
   const costBps = Math.max(0, (opts && opts.costBps) || 0);
+  const direction = (opts && opts.direction) || "both";
+  const canLong = direction !== "short";
+  const canShort = direction !== "long";
   const cost = costBps / 1e4;
   const equity = [{ d: "", v: 1 }];
   let peak = 1, maxDD = 0;
   let hits = 0, trades = 0, sumRet = 0, sumRet2 = 0;
+  let longN = 0, shortN = 0, longSum = 0, shortSum = 0, longWins = 0, shortWins = 0;
   const upRets = [], dnRets = [];
   for (let i = 0; i < rows.length; i++) {
     const rF = retOf(rows[i], mode);
     const s = signals[i];
     let dayRet = 0, side = 0;
-    if (s > 0 && s >= thrUp) side = +1;
-    else if (s < 0 && -s >= thrDn) side = -1;
+    if (s > 0 && s >= thrUp && canLong) side = +1;
+    else if (s < 0 && -s >= thrDn && canShort) side = -1;
     if (side !== 0) {
       dayRet = side * rF - 2 * cost;
       trades++;
-      if ((side > 0 && rF > 0) || (side < 0 && rF < 0)) hits++;
-      if (side > 0) upRets.push(rF); else dnRets.push(rF);
+      const isHit = (side > 0 && rF > 0) || (side < 0 && rF < 0);
+      if (isHit) hits++;
+      if (side > 0) { longN++; longSum += dayRet; if (isHit) longWins++; upRets.push(rF); }
+      else { shortN++; shortSum += dayRet; if (isHit) shortWins++; dnRets.push(rF); }
       sumRet += dayRet;
       sumRet2 += dayRet * dayRet;
     }
@@ -186,16 +190,19 @@ function backtestEx(rows, signals, mode, opts) {
     avgRet: avg, sharpe, maxDD,
     upMean: upRets.length ? upRets.reduce((s, v) => s + v, 0) / upRets.length : 0, upN: upRets.length,
     dnMean: dnRets.length ? dnRets.reduce((s, v) => s + v, 0) / dnRets.length : 0, dnN: dnRets.length,
+    longN, longAvg: longN ? longSum / longN : 0, longHit: longN ? longWins / longN : 0,
+    shortN, shortAvg: shortN ? shortSum / shortN : 0, shortHit: shortN ? shortWins / shortN : 0,
     finalV: equity[equity.length - 1].v,
   };
 }
 
 // Scan thresholds 0–3% to find the best symmetric and asymmetric cutoffs.
-function scanThresholds(rows, signals, mode, costBps) {
+function scanThresholds(rows, signals, mode, costBps, direction) {
+  const dir = direction || "both";
   const step = 0.001, max = 0.03;
   const curve = [];
   for (let t = 0; t <= max + 1e-9; t += step) {
-    const bt = backtestEx(rows, signals, mode, { thrUp: t, thrDn: t, costBps });
+    const bt = backtestEx(rows, signals, mode, { thrUp: t, thrDn: t, costBps, direction: dir });
     curve.push({ t, sharpe: bt.sharpe, hit: bt.hitRate, n: bt.trades, finalV: bt.finalV });
   }
   let bestSym = curve[0];
@@ -203,7 +210,7 @@ function scanThresholds(rows, signals, mode, costBps) {
   const grid = [0, 0.002, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03];
   let bestAsym = null;
   for (const u of grid) for (const d of grid) {
-    const bt = backtestEx(rows, signals, mode, { thrUp: u, thrDn: d, costBps });
+    const bt = backtestEx(rows, signals, mode, { thrUp: u, thrDn: d, costBps, direction: dir });
     if (bt.trades < 30) continue;
     if (!bestAsym || bt.sharpe > bestAsym.sharpe) bestAsym = { up: u, dn: d, ...bt };
   }
@@ -289,6 +296,7 @@ async function runPair() {
   const mode = document.getElementById("pMode").value;
   const years = Math.max(1, parseFloat(document.getElementById("pYears").value) || 5);
   const costBps = Math.max(0, parseFloat(document.getElementById("pCost").value) || 0);
+  const direction = document.getElementById("pDir").value; // "both" | "long" | "short"
   try {
     const [L, F] = await Promise.all([loadSeries(leaderId, years), loadSeries(follId, years)]);
     if (!L.rows.length || !F.rows.length) throw new Error("Empty series");
@@ -309,13 +317,13 @@ async function runPair() {
       thrUp = t.thrUp; thrDn = t.thrDn;
       thrLabel = `top/bot ${Math.abs(thrPctUp) || 20}% (up≥${fmtPct(thrUp, 2)}, dn≤−${fmtPct(thrDn, 2)})`;
     } else {
-      // auto: run scan and pick best asymmetric
-      const sc = scanThresholds(pairs, xs, mode, costBps);
+      // auto: scan thresholds within the chosen direction
+      const sc = scanThresholds(pairs, xs, mode, costBps, direction);
       if (sc.bestAsym) { thrUp = sc.bestAsym.up; thrDn = sc.bestAsym.dn; }
       thrLabel = `auto (up≥${fmtPct(thrUp, 2)}, dn≤−${fmtPct(thrDn, 2)})`;
     }
-    const bt = backtestEx(pairs, xs, mode, { thrUp, thrDn, costBps });
-    const scan = scanThresholds(pairs, xs, mode, costBps);
+    const bt = backtestEx(pairs, xs, mode, { thrUp, thrDn, costBps, direction });
+    const scan = scanThresholds(pairs, xs, mode, costBps, direction);
 
     const latest = pairs[pairs.length - 1];
     const latestL = latest.rL;
@@ -329,7 +337,7 @@ async function runPair() {
       const pp = alignSeries(L, F, k);
       if (pp.length < 30) { lagRows.push({ k, skipped: true }); continue; }
       const rg = regress(pp.map(p => p.rL), pp.map(p => modeRet(p, mode)));
-      const b = backtestEx(pp, pp.map(p => p.rL), mode, { thrUp, thrDn, costBps });
+      const b = backtestEx(pp, pp.map(p => p.rL), mode, { thrUp, thrDn, costBps, direction });
       lagRows.push({ k, corr: rg.corr, t: rg.t, hit: b.hitRate, sharpe: b.sharpe, finalV: b.finalV, trades: b.trades });
     }
     const lagTable = `
@@ -379,7 +387,7 @@ async function runPair() {
 
     out.innerHTML = `
       <div class="signal">
-        <div class="h">Current signal · ${MODE_LABEL[mode]} · lag ${lag} · filter: ${thrLabel} · cost ${costBps}bps</div>
+        <div class="h">Current signal · ${MODE_LABEL[mode]} · lag ${lag} · ${direction} · ${thrLabel} · cost ${costBps}bps</div>
         <div class="b">
           ${L.name} ${latest.dL}: <span class="em ${latestL >= 0 ? "up" : "dn"}">${fmtPct(latestL)}</span>
           → คาดว่า ${F.name} ${latest.dF}
@@ -393,8 +401,8 @@ async function runPair() {
         <div class="stat"><div class="l">β (slope)</div><div class="v ${cls(reg.b)}">${fmtNum(reg.b, 3)}</div><div class="s">R²=${fmtNum(reg.r2, 3)}</div></div>
         <div class="stat"><div class="l">t-stat (β)</div><div class="v ${Math.abs(reg.t) >= 2 ? "pos" : ""}">${fmtNum(reg.t, 2)}</div><div class="s">${Math.abs(reg.t) >= 2 ? "significant" : "weak"}</div></div>
         <div class="stat"><div class="l">Hit rate</div><div class="v">${fmtPct(bt.hitRate, 1)}</div><div class="s">${bt.trades} trades</div></div>
-        <div class="stat"><div class="l">Leader up → follower</div><div class="v ${cls(bt.upMean)}">${fmtPct(bt.upMean, 2)}</div><div class="s">N=${bt.upN}</div></div>
-        <div class="stat"><div class="l">Leader down → follower</div><div class="v ${cls(bt.dnMean)}">${fmtPct(bt.dnMean, 2)}</div><div class="s">N=${bt.dnN}</div></div>
+        <div class="stat"><div class="l">LONG side</div><div class="v ${cls(bt.longAvg)}">${fmtPct(bt.longAvg, 2)}</div><div class="s">N=${bt.longN} · hit ${fmtPct(bt.longHit, 0)}</div></div>
+        <div class="stat"><div class="l">SHORT side</div><div class="v ${cls(bt.shortAvg)}">${fmtPct(bt.shortAvg, 2)}</div><div class="s">N=${bt.shortN} · hit ${fmtPct(bt.shortHit, 0)}</div></div>
         <div class="stat"><div class="l">Sharpe (ann.)</div><div class="v ${cls(bt.sharpe)}">${fmtNum(bt.sharpe, 2)}</div><div class="s">signal-only</div></div>
         <div class="stat"><div class="l">Final equity</div><div class="v ${bt.finalV >= 1 ? "pos" : "neg"}">${fmtNum(bt.finalV, 3)}×</div><div class="s">${fmtPct(bt.finalV - 1, 1)}</div></div>
         <div class="stat"><div class="l">Max drawdown</div><div class="v neg">${fmtPct(bt.maxDD, 1)}</div><div class="s">peak→trough</div></div>
@@ -478,6 +486,7 @@ async function runSearch() {
   const thr = Math.abs(parseFloat(document.getElementById("xThr").value) || 0) / 100;
   const years = Math.max(1, parseFloat(document.getElementById("xYears").value) || 5);
   const costBps = Math.max(0, parseFloat(document.getElementById("xCost").value) || 0);
+  const dirChoice = document.getElementById("xDir").value; // "auto" | "both" | "long" | "short"
   try {
     const F = await loadSeries(followerId, years);
     const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
@@ -503,22 +512,32 @@ async function runSearch() {
         // In-sample and OOS predictions.
         const predIn = fit.pred;
         const predOut = Xtest.map(row => row.reduce((s, v, i) => s + v * fit.beta[i], 0));
-        // Tune threshold on TRAIN set, then apply to OOS — no look-ahead.
-        let tunedUp = thr, tunedDn = thr;
-        if (thr === 0) {
-          const tune = scanThresholds(aligned.slice(0, split), predIn, mode, costBps);
-          if (tune.bestAsym) { tunedUp = tune.bestAsym.up; tunedDn = tune.bestAsym.dn; }
+        // Pick direction: either user-forced, or auto (try all, best on TRAIN).
+        const dirCandidates = dirChoice === "auto" ? ["both", "long", "short"] : [dirChoice];
+        let bestOnTrain = null;
+        for (const d of dirCandidates) {
+          // Tune threshold per direction on TRAIN set — no look-ahead.
+          let tu = thr, td = thr;
+          if (thr === 0) {
+            const tune = scanThresholds(aligned.slice(0, split), predIn, mode, costBps, d);
+            if (tune.bestAsym) { tu = tune.bestAsym.up; td = tune.bestAsym.dn; }
+          }
+          const trBt = backtestEx(aligned.slice(0, split), predIn, mode, { thrUp: tu, thrDn: td, costBps, direction: d });
+          if (!bestOnTrain || trBt.sharpe > bestOnTrain.trBt.sharpe) bestOnTrain = { direction: d, tu, td, trBt };
         }
-        const btIn = backtestEx(aligned.slice(0, split), predIn, mode, { thrUp: tunedUp, thrDn: tunedDn, costBps });
-        const btOut = backtestEx(aligned.slice(split), predOut, mode, { thrUp: tunedUp, thrDn: tunedDn, costBps });
+        const tunedUp = bestOnTrain.tu, tunedDn = bestOnTrain.td, direction = bestOnTrain.direction;
+        const btIn = bestOnTrain.trBt;
+        const btOut = backtestEx(aligned.slice(split), predOut, mode, { thrUp: tunedUp, thrDn: tunedDn, costBps, direction });
         results.push({
           combo, k,
           adjR2: fit.adjR2,
           r2: fit.r2,
           beta: fit.beta,
-          thrUp: tunedUp, thrDn: tunedDn,
+          thrUp: tunedUp, thrDn: tunedDn, direction,
           insSharpe: btIn.sharpe, insHit: btIn.hitRate, insEq: btIn.finalV, insN: btIn.trades,
           oosSharpe: btOut.sharpe, oosHit: btOut.hitRate, oosEq: btOut.finalV, oosN: btOut.trades,
+          oosLongN: btOut.longN, oosLongAvg: btOut.longAvg, oosLongHit: btOut.longHit,
+          oosShortN: btOut.shortN, oosShortAvg: btOut.shortAvg, oosShortHit: btOut.shortHit,
           oosMaxDD: btOut.maxDD,
         });
       }
@@ -535,6 +554,9 @@ async function runSearch() {
     const bestLabel = best.combo.map(nameOf).join(" + ");
     const betaInfo = best.combo.map((id, i) => `${nameOf(id)}: ${best.beta[i + 1].toFixed(3)}`).join(", ");
     const thrInfo = `up≥${fmtPct(best.thrUp, 2)}, dn≤−${fmtPct(best.thrDn, 2)}`;
+    const dirInfo = best.direction === "long" ? "LONG only (ข้ามสัญญาณลบ)"
+      : best.direction === "short" ? "SHORT only (ข้ามสัญญาณบวก)"
+      : "ทั้ง LONG และ SHORT";
 
     // Build per-day breakdown for the best combo over the FULL aligned window so we
     // can show exactly what every leader contributed to the prediction each day,
@@ -551,9 +573,11 @@ async function runSearch() {
         contrib: best.beta[k + 1] * row.lr[id],
       }));
       const rF = mode === "oc" ? row.rF_oc : mode === "co" ? row.rF_co : row.rF_cc;
+      const canLong = best.direction !== "short";
+      const canShort = best.direction !== "long";
       let side = 0;
-      if (pred > 0 && pred >= best.thrUp) side = 1;
-      else if (pred < 0 && -pred >= best.thrDn) side = -1;
+      if (pred > 0 && pred >= best.thrUp && canLong) side = 1;
+      else if (pred < 0 && -pred >= best.thrDn && canShort) side = -1;
       const gross = side !== 0 ? side * rF : 0;
       const net = side !== 0 ? gross - 2 * (costBps / 1e4) : 0;
       return { dF: row.dF, contribs, pred, intercept: best.beta[0], rF, side, gross, net, oos: i >= isOOSStart };
@@ -622,18 +646,25 @@ async function runSearch() {
     }
     const profitFactor = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : 0;
 
+    const entryLong = best.direction === "short"
+      ? `<span style="color:var(--muted)">ปิดไว้ (direction=SHORT only)</span>`
+      : `เมื่อ <code>predicted ≥ +${fmtPct(best.thrUp, 2)}</code> → ซื้อ ${followerName} ที่ ${mode === "co" ? "open" : "close"}`;
+    const entryShort = best.direction === "long"
+      ? `<span style="color:var(--muted)">ปิดไว้ (direction=LONG only)</span>`
+      : `เมื่อ <code>predicted ≤ −${fmtPct(best.thrDn, 2)}</code> → ชอร์ท ${followerName} ที่ ${mode === "co" ? "open" : "close"}`;
     const strategyBox = `
       <div class="chart" style="border-left:3px solid var(--accent)"><h3>Strategy rules (as executed)</h3>
         <div style="font-size:.82rem;line-height:1.7;padding:4px 2px">
           <strong>Setup:</strong> คำนวณค่าทำนาย ${followerName} ${MODE_LABEL[mode]} วันถัดไปจาก
           ${best.combo.map((id, i) => `<code>${fmtNum(best.beta[i + 1], 3)}×${nameOf(id)}</code>`).join(" + ")}
           ${best.beta[0] >= 0 ? "+" : "−"} <code>${fmtPct(Math.abs(best.beta[0]), 3)}</code> (intercept)<br>
-          <strong>Entry LONG:</strong> เมื่อ <code>predicted ≥ +${fmtPct(best.thrUp, 2)}</code> → ซื้อ ${followerName} ที่ ${mode === "co" ? "open" : "close"}<br>
-          <strong>Entry SHORT:</strong> เมื่อ <code>predicted ≤ −${fmtPct(best.thrDn, 2)}</code> → ชอร์ท ${followerName} ที่ ${mode === "co" ? "open" : "close"}<br>
+          <strong>Direction:</strong> ${dirInfo}<br>
+          <strong>Entry LONG:</strong> ${entryLong}<br>
+          <strong>Entry SHORT:</strong> ${entryShort}<br>
           <strong>Exit:</strong> ${mode === "co" ? "ปิดที่ open (gap-only)" : mode === "oc" ? "ปิดที่ close วันเดียวกัน (intraday)" : "ปิดที่ close วันถัดไป"}<br>
           <strong>No-trade:</strong> ถ้า prediction อยู่ในช่วง <code>(−${fmtPct(best.thrDn, 2)}, +${fmtPct(best.thrUp, 2)})</code> ไม่เทรด<br>
           <strong>Costs:</strong> ${costBps} bps ต่อ round-trip · <strong>Sizing:</strong> ทุ่มเงินทั้งหมด (1× equity)<br>
-          <strong>Thresholds tuned:</strong> บน train set เท่านั้น (70% ของ ${aligned.length} วัน) — test ด้านล่างคือ OOS ${aligned.length - split} วัน
+          <strong>Thresholds + direction tuned:</strong> บน train set เท่านั้น (70% ของ ${aligned.length} วัน) — test ด้านล่างคือ OOS ${aligned.length - split} วัน
         </div>
       </div>`;
 
@@ -648,6 +679,8 @@ async function runSearch() {
           <div class="stat"><div class="l">Avg loss</div><div class="v neg">${fmtPct(losses ? sumLoss / losses : 0, 2)}</div><div class="s">per trade</div></div>
           <div class="stat"><div class="l">Max drawdown</div><div class="v neg">${fmtPct(maxDDd, 1)}</div><div class="s">equity basis</div></div>
           <div class="stat"><div class="l">OOS Sharpe</div><div class="v ${cls(best.oosSharpe)}">${fmtNum(best.oosSharpe, 2)}</div><div class="s">annualised</div></div>
+          <div class="stat"><div class="l">LONG (OOS)</div><div class="v ${cls(best.oosLongAvg)}">${fmtPct(best.oosLongAvg, 2)}</div><div class="s">N=${best.oosLongN} · hit ${fmtPct(best.oosLongHit, 0)}</div></div>
+          <div class="stat"><div class="l">SHORT (OOS)</div><div class="v ${cls(best.oosShortAvg)}">${fmtPct(best.oosShortAvg, 2)}</div><div class="s">N=${best.oosShortN} · hit ${fmtPct(best.oosShortHit, 0)}</div></div>
         </div>
         <h3 style="margin-top:14px">Trade log · last ${Math.min(trades.length, 30)} OOS trades</h3>
         <div class="screener-table"><table>
@@ -659,7 +692,7 @@ async function runSearch() {
     const tbody = top.map((r, i) => `
       <tr${i === 0 ? ' style="background:var(--panel-2)"' : ''}>
         <td>${i + 1}</td>
-        <td>${r.combo.map(nameOf).join(" + ")}<div style="font-size:.65rem;color:var(--muted)">${r.combo.join(", ")}</div></td>
+        <td>${r.combo.map(nameOf).join(" + ")}<div style="font-size:.65rem;color:var(--muted)">${r.combo.join(", ")} · ${r.direction}</div></td>
         <td>${r.k}</td>
         <td>${fmtNum(r.adjR2, 3)}</td>
         <td class="${cls(r.insSharpe)}">${fmtNum(r.insSharpe, 2)}</td>
@@ -803,7 +836,7 @@ async function boot() {
   document.getElementById("sGo").addEventListener("click", runScreener);
   document.getElementById("xGo").addEventListener("click", runSearch);
   // Re-run on control change for snappier UX
-  ["pLeader", "pFollower", "pLag", "pThrUp", "pThrDn", "pFilter", "pMode", "pCost", "pYears"].forEach(id => {
+  ["pLeader", "pFollower", "pLag", "pThrUp", "pThrDn", "pFilter", "pMode", "pDir", "pCost", "pYears"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener("change", () => runPair().catch(() => {}));
   });
