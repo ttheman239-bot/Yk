@@ -30,6 +30,65 @@ function sortRows(rows) {
   return rows.slice().sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
 }
 
+// Solve A x = b via Gauss-Jordan elimination with partial pivoting.
+function solveLinear(A, b) {
+  const n = A.length;
+  const M = A.map((row, i) => row.concat(b[i]));
+  for (let i = 0; i < n; i++) {
+    let mx = i;
+    for (let k = i + 1; k < n; k++) if (Math.abs(M[k][i]) > Math.abs(M[mx][i])) mx = k;
+    [M[i], M[mx]] = [M[mx], M[i]];
+    const pivot = M[i][i];
+    if (Math.abs(pivot) < 1e-12) return null; // singular
+    for (let j = i; j <= n; j++) M[i][j] /= pivot;
+    for (let k = 0; k < n; k++) if (k !== i) {
+      const f = M[k][i];
+      for (let j = i; j <= n; j++) M[k][j] -= f * M[i][j];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+// Ordinary least squares for y = X β, X has intercept column already.
+// Returns { beta, r2, adjR2, f, sse, n, k }.
+function multiRegress(X, y) {
+  const n = X.length, k = X[0].length;
+  if (n <= k + 1) return null;
+  const xtx = Array.from({ length: k }, () => new Array(k).fill(0));
+  const xty = new Array(k).fill(0);
+  for (let i = 0; i < n; i++) {
+    for (let a = 0; a < k; a++) {
+      xty[a] += X[i][a] * y[i];
+      for (let b = 0; b < k; b++) xtx[a][b] += X[i][a] * X[i][b];
+    }
+  }
+  const beta = solveLinear(xtx, xty);
+  if (!beta) return null;
+  const my = y.reduce((s, v) => s + v, 0) / n;
+  let sse = 0, sst = 0;
+  const pred = new Array(n);
+  for (let i = 0; i < n; i++) {
+    let p = 0;
+    for (let a = 0; a < k; a++) p += beta[a] * X[i][a];
+    pred[i] = p;
+    sse += (y[i] - p) ** 2;
+    sst += (y[i] - my) ** 2;
+  }
+  const r2 = sst > 0 ? 1 - sse / sst : 0;
+  const adjR2 = 1 - (1 - r2) * (n - 1) / Math.max(n - k, 1);
+  const f = k > 1 ? ((sst - sse) / (k - 1)) / (sse / Math.max(n - k, 1)) : 0;
+  return { beta, r2, adjR2, f, sse, n, k, pred };
+}
+
+// All combinations of `arr` taking exactly `k` elements.
+function combinations(arr, k) {
+  if (k === 0) return [[]];
+  if (k > arr.length) return [];
+  const [first, ...rest] = arr;
+  return combinations(rest, k - 1).map(c => [first, ...c]).concat(combinations(rest, k));
+}
+
+
 function trimYears(rows, years) {
   if (!years) return rows;
   const cutoff = new Date(Date.now() - years * 365.25 * 86400 * 1000).toISOString().slice(0, 10);
@@ -291,6 +350,190 @@ async function runPair() {
   }
 }
 
+// Build a single table where each row is a follower trading day and columns hold that
+// follower day's returns plus the most-recent lag-1 return of every supplied leader.
+function alignMulti(follower, leaders, lag) {
+  const F = follower.rows;
+  const leaderIds = Object.keys(leaders);
+  // Precompute daily returns for each leader.
+  const lRet = {}, lDates = {};
+  for (const id of leaderIds) {
+    const r = leaders[id].rows;
+    const rets = new Array(r.length).fill(null);
+    for (let i = 1; i < r.length; i++) {
+      if (r[i].c > 0 && r[i - 1].c > 0) rets[i] = r[i].c / r[i - 1].c - 1;
+    }
+    lRet[id] = rets;
+    lDates[id] = r.map(x => x.d);
+  }
+  const ptr = Object.fromEntries(leaderIds.map(id => [id, 0]));
+  const out = [];
+  for (let j = 1; j < F.length; j++) {
+    const fC = F[j], fP = F[j - 1];
+    if (!(fC.c > 0 && fP.c > 0 && fC.o > 0)) continue;
+    const dF = fC.d;
+    const rF_cc = fC.c / fP.c - 1;
+    const rF_oc = fC.c / fC.o - 1;
+    const rF_co = fC.o / fP.c - 1;
+    const leaderVals = {};
+    let complete = true;
+    for (const id of leaderIds) {
+      const dates = lDates[id];
+      while (ptr[id] < dates.length && dates[ptr[id]] < dF) ptr[id]++;
+      // ptr[id] is first leader index with date >= dF. We want the return at lag trading days before dF.
+      const idx = ptr[id] - lag;
+      if (idx < 1 || idx >= lRet[id].length || lRet[id][idx] == null) { complete = false; break; }
+      leaderVals[id] = lRet[id][idx];
+    }
+    if (!complete) continue;
+    out.push({ dF, rF_cc, rF_oc, rF_co, lr: leaderVals });
+  }
+  return out;
+}
+
+// Compute backtest stats for an arbitrary predicted-signal array (one per row).
+function backtestSignal(rows, predictions, mode, thr) {
+  const equity = [{ d: "", v: 1 }];
+  let peak = 1, maxDD = 0;
+  let hits = 0, trades = 0, sumRet = 0, sumRet2 = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const rF = mode === "oc" ? rows[i].rF_oc : mode === "co" ? rows[i].rF_co : rows[i].rF_cc;
+    const pred = predictions[i];
+    let dayRet = 0;
+    if (Math.abs(pred) >= thr) {
+      const side = pred > 0 ? 1 : -1;
+      dayRet = side * rF;
+      trades++;
+      if ((pred > 0 && rF > 0) || (pred < 0 && rF < 0)) hits++;
+      sumRet += dayRet;
+      sumRet2 += dayRet * dayRet;
+    }
+    const v = equity[equity.length - 1].v * (1 + dayRet);
+    equity.push({ d: rows[i].dF, v });
+    if (v > peak) peak = v;
+    maxDD = Math.min(maxDD, (v - peak) / peak);
+  }
+  const avg = trades ? sumRet / trades : 0;
+  const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avg * avg) : 0;
+  const sharpe = std > 0 ? (avg / std) * Math.sqrt(252) : 0;
+  return {
+    equity, trades, hitRate: trades ? hits / trades : 0,
+    avgRet: avg, sharpe, maxDD,
+    finalV: equity[equity.length - 1].v,
+  };
+}
+
+async function runSearch() {
+  const out = document.getElementById("xOut");
+  out.innerHTML = `<div class="loading">Loading leader history + searching combinations…</div>`;
+  const followerId = document.getElementById("xFollower").value;
+  const maxK = Math.max(1, parseInt(document.getElementById("xMaxK").value) || 3);
+  const lag = Math.max(1, parseInt(document.getElementById("xLag").value) || 1);
+  const mode = document.getElementById("xMode").value;
+  const thr = Math.abs(parseFloat(document.getElementById("xThr").value) || 0) / 100;
+  const years = Math.max(1, parseFloat(document.getElementById("xYears").value) || 5);
+  try {
+    const F = await loadSeries(followerId, years);
+    const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
+    const leaderData = {};
+    for (const l of leaderList) leaderData[l.id] = await loadSeries(l.id, years);
+    const aligned = alignMulti(F, leaderData, lag);
+    if (aligned.length < 100) throw new Error(`Only ${aligned.length} aligned rows — try lowering window`);
+
+    const y = aligned.map(r => mode === "oc" ? r.rF_oc : mode === "co" ? r.rF_co : r.rF_cc);
+    // 70/30 train/test split
+    const split = Math.floor(aligned.length * 0.7);
+
+    const leaderIds = leaderList.map(l => l.id);
+    const results = [];
+
+    for (let k = 1; k <= Math.min(maxK, leaderIds.length, 5); k++) {
+      for (const combo of combinations(leaderIds, k)) {
+        const X = aligned.map(r => [1, ...combo.map(id => r.lr[id])]);
+        const Xtrain = X.slice(0, split), yTrain = y.slice(0, split);
+        const Xtest = X.slice(split), yTest = y.slice(split);
+        const fit = multiRegress(Xtrain, yTrain);
+        if (!fit) continue;
+        // In-sample and OOS predictions.
+        const predIn = fit.pred;
+        const predOut = Xtest.map(row => row.reduce((s, v, i) => s + v * fit.beta[i], 0));
+        const btIn = backtestSignal(aligned.slice(0, split), predIn, mode, thr);
+        const btOut = backtestSignal(aligned.slice(split), predOut, mode, thr);
+        results.push({
+          combo, k,
+          adjR2: fit.adjR2,
+          r2: fit.r2,
+          beta: fit.beta,
+          insSharpe: btIn.sharpe, insHit: btIn.hitRate, insEq: btIn.finalV, insN: btIn.trades,
+          oosSharpe: btOut.sharpe, oosHit: btOut.hitRate, oosEq: btOut.finalV, oosN: btOut.trades,
+          oosMaxDD: btOut.maxDD,
+        });
+      }
+    }
+
+    results.sort((a, b) => b.oosSharpe - a.oosSharpe);
+    const top = results.slice(0, 20);
+    if (!top.length) { out.innerHTML = `<div class="err">No viable combinations.</div>`; return; }
+
+    const nameOf = id => (manifest.symbols.find(s => s.id === id) || {}).name || id;
+
+    // Headline best combo details.
+    const best = top[0];
+    const bestLabel = best.combo.map(nameOf).join(" + ");
+    const betaInfo = best.combo.map((id, i) => `${nameOf(id)}: ${best.beta[i + 1].toFixed(3)}`).join(", ");
+
+    const tbody = top.map((r, i) => `
+      <tr${i === 0 ? ' style="background:var(--panel-2)"' : ''}>
+        <td>${i + 1}</td>
+        <td>${r.combo.map(nameOf).join(" + ")}<div style="font-size:.65rem;color:var(--muted)">${r.combo.join(", ")}</div></td>
+        <td>${r.k}</td>
+        <td>${fmtNum(r.adjR2, 3)}</td>
+        <td class="${cls(r.insSharpe)}">${fmtNum(r.insSharpe, 2)}</td>
+        <td class="${cls(r.oosSharpe)}">${fmtNum(r.oosSharpe, 2)}</td>
+        <td>${fmtPct(r.oosHit, 1)}</td>
+        <td class="${r.oosEq >= 1 ? "pos" : "neg"}">${fmtNum(r.oosEq, 2)}×</td>
+        <td>${r.oosN}</td>
+      </tr>`).join("");
+
+    // Best-of-k summary: for each k=1..maxK show the winner.
+    const byK = {};
+    for (const r of results) if (!byK[r.k] || r.oosSharpe > byK[r.k].oosSharpe) byK[r.k] = r;
+    const kSummary = Object.keys(byK).sort().map(k => {
+      const r = byK[k];
+      return `<tr><td>${k}</td><td>${r.combo.map(nameOf).join(" + ")}</td><td class="${cls(r.oosSharpe)}">${fmtNum(r.oosSharpe, 2)}</td><td>${fmtPct(r.oosHit, 1)}</td><td class="${r.oosEq >= 1 ? "pos" : "neg"}">${fmtNum(r.oosEq, 2)}×</td></tr>`;
+    }).join("");
+
+    out.innerHTML = `
+      <div class="signal">
+        <div class="h">Best combo (out-of-sample, ${mode}, lag ${lag})</div>
+        <div class="b">
+          <strong>${bestLabel}</strong> → OOS Sharpe <span class="em ${cls(best.oosSharpe)}">${fmtNum(best.oosSharpe, 2)}</span> ·
+          hit <span class="em">${fmtPct(best.oosHit, 1)}</span> ·
+          equity <span class="em ${best.oosEq >= 1 ? "up" : "dn"}">${fmtNum(best.oosEq, 2)}×</span> ·
+          adj R² ${fmtNum(best.adjR2, 3)}
+          <div style="font-size:.72rem;color:var(--muted);margin-top:6px">β = ${betaInfo}</div>
+        </div>
+      </div>
+
+      <div class="chart"><h3>Best signal by combo size k</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>k</th><th>Best combo</th><th>OOS Sharpe</th><th>OOS Hit</th><th>OOS Equity</th></tr></thead>
+          <tbody>${kSummary}</tbody>
+        </table></div>
+      </div>
+
+      <div class="chart"><h3>Top 20 combinations (ranked by OOS Sharpe)</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>#</th><th>Leaders</th><th>k</th><th>Adj R²</th><th>IS Sharpe</th><th>OOS Sharpe</th><th>OOS Hit</th><th>OOS Equity</th><th>OOS N</th></tr></thead>
+          <tbody>${tbody}</tbody>
+        </table></div>
+      </div>
+    `;
+  } catch (e) {
+    out.innerHTML = `<div class="err">Error: ${e.message}</div>`;
+  }
+}
+
 async function runScreener() {
   const out = document.getElementById("sOut");
   out.innerHTML = `<div class="loading">Loading data for all followers…</div>`;
@@ -361,9 +604,11 @@ async function boot() {
     fillSelect(document.getElementById("pLeader"), manifest.symbols, s => s.role !== "follower");
     fillSelect(document.getElementById("pFollower"), manifest.symbols, s => s.role !== "leader");
     fillSelect(document.getElementById("sLeader"), manifest.symbols, s => s.role !== "follower");
+    fillSelect(document.getElementById("xFollower"), manifest.symbols, s => s.role !== "leader");
     document.getElementById("pLeader").value = "^spx";
     document.getElementById("pFollower").value = "^set";
     document.getElementById("sLeader").value = "^spx";
+    document.getElementById("xFollower").value = "^set";
     // Auto-run initial pair analysis
     runPair().catch(() => {});
   } catch (e) {
@@ -378,6 +623,7 @@ async function boot() {
   }));
   document.getElementById("pGo").addEventListener("click", runPair);
   document.getElementById("sGo").addEventListener("click", runScreener);
+  document.getElementById("xGo").addEventListener("click", runSearch);
   // Re-run on control change for snappier UX
   ["pLeader", "pFollower", "pLag", "pThr", "pMode", "pYears"].forEach(id => {
     document.getElementById(id).addEventListener("change", () => runPair().catch(() => {}));
