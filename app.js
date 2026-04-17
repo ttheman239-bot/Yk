@@ -536,6 +536,126 @@ async function runSearch() {
     const betaInfo = best.combo.map((id, i) => `${nameOf(id)}: ${best.beta[i + 1].toFixed(3)}`).join(", ");
     const thrInfo = `up≥${fmtPct(best.thrUp, 2)}, dn≤−${fmtPct(best.thrDn, 2)}`;
 
+    // Build per-day breakdown for the best combo over the FULL aligned window so we
+    // can show exactly what every leader contributed to the prediction each day,
+    // whether a trade fired, and what the realised P&L was.
+    const followerName = F.name;
+    const isOOSStart = split;
+    const perDay = aligned.map((row, i) => {
+      const xRow = [1, ...best.combo.map(id => row.lr[id])];
+      const pred = xRow.reduce((s, v, k) => s + v * best.beta[k], 0);
+      const contribs = best.combo.map((id, k) => ({
+        id, name: nameOf(id),
+        leaderRet: row.lr[id],
+        beta: best.beta[k + 1],
+        contrib: best.beta[k + 1] * row.lr[id],
+      }));
+      const rF = mode === "oc" ? row.rF_oc : mode === "co" ? row.rF_co : row.rF_cc;
+      let side = 0;
+      if (pred > 0 && pred >= best.thrUp) side = 1;
+      else if (pred < 0 && -pred >= best.thrDn) side = -1;
+      const gross = side !== 0 ? side * rF : 0;
+      const net = side !== 0 ? gross - 2 * (costBps / 1e4) : 0;
+      return { dF: row.dF, contribs, pred, intercept: best.beta[0], rF, side, gross, net, oos: i >= isOOSStart };
+    });
+
+    // Latest signal breakdown (whatever the newest aligned day is, OOS or not).
+    const latest = perDay[perDay.length - 1];
+    const contribRows = latest.contribs.map(c => `
+      <tr>
+        <td>${c.name}<div style="font-size:.65rem;color:var(--muted)">${c.id}</div></td>
+        <td class="${cls(c.leaderRet)}">${fmtPct(c.leaderRet, 2)}</td>
+        <td>${fmtNum(c.beta, 3)}</td>
+        <td class="${cls(c.contrib)}">${fmtPct(c.contrib, 3)}</td>
+      </tr>`).join("");
+    const latestAction = latest.side > 0 ? `<span class="em up">LONG ${followerName}</span>`
+      : latest.side < 0 ? `<span class="em dn">SHORT ${followerName}</span>`
+      : `<span class="em" style="color:var(--muted)">NO TRADE (threshold not met)</span>`;
+    const latestBreakdown = `
+      <div class="chart"><h3>Latest signal breakdown · ${latest.dF}</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>Leader</th><th>Return</th><th>β</th><th>Contribution</th></tr></thead>
+          <tbody>
+            ${contribRows}
+            <tr style="background:var(--panel-2);font-weight:700">
+              <td>Intercept α</td><td>—</td><td>—</td><td class="${cls(latest.intercept)}">${fmtPct(latest.intercept, 3)}</td>
+            </tr>
+            <tr style="background:var(--panel-2);font-weight:700">
+              <td>Predicted ${followerName} ${MODE_LABEL[mode]}</td><td colspan="2">—</td>
+              <td class="${cls(latest.pred)}">${fmtPct(latest.pred, 3)}</td>
+            </tr>
+          </tbody>
+        </table></div>
+        <div style="font-size:.8rem;margin-top:8px;padding:8px;background:var(--panel-2);border-radius:6px">
+          Trigger check: |pred| ${fmtPct(Math.abs(latest.pred), 2)} vs thresholds ${thrInfo} →
+          <strong>${latestAction}</strong>
+        </div>
+      </div>`;
+
+    // Realistic trade log — OOS trades only (what would have happened if you started
+    // deploying the model on day split+1). Starting equity 10,000 baht.
+    const START = 10000;
+    const trades = perDay.filter(d => d.oos && d.side !== 0);
+    let equity = START;
+    const logRows = trades.slice(-30).map(d => {
+      equity *= (1 + d.net);
+      const topContribs = d.contribs.map(c => `${c.name.split(" ")[0]} ${fmtPct(c.leaderRet, 1)}`).join(" · ");
+      return `
+        <tr>
+          <td>${d.dF}</td>
+          <td class="${d.side > 0 ? "pos" : "neg"}">${d.side > 0 ? "LONG" : "SHORT"}</td>
+          <td style="font-size:.65rem;color:var(--muted);white-space:normal">${topContribs}</td>
+          <td class="${cls(d.pred)}">${fmtPct(d.pred, 2)}</td>
+          <td class="${cls(d.rF)}">${fmtPct(d.rF, 2)}</td>
+          <td class="${cls(d.net)}">${fmtPct(d.net, 2)}</td>
+          <td>${equity.toFixed(0)}</td>
+        </tr>`;
+    }).join("");
+    // Full OOS P&L stats
+    let fullEquity = START;
+    let wins = 0, losses = 0, sumWin = 0, sumLoss = 0, maxEq = START, maxDDd = 0;
+    for (const d of trades) {
+      fullEquity *= (1 + d.net);
+      if (d.net > 0) { wins++; sumWin += d.net; } else if (d.net < 0) { losses++; sumLoss += d.net; }
+      if (fullEquity > maxEq) maxEq = fullEquity;
+      maxDDd = Math.min(maxDDd, (fullEquity - maxEq) / maxEq);
+    }
+    const profitFactor = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : 0;
+
+    const strategyBox = `
+      <div class="chart" style="border-left:3px solid var(--accent)"><h3>Strategy rules (as executed)</h3>
+        <div style="font-size:.82rem;line-height:1.7;padding:4px 2px">
+          <strong>Setup:</strong> คำนวณค่าทำนาย ${followerName} ${MODE_LABEL[mode]} วันถัดไปจาก
+          ${best.combo.map((id, i) => `<code>${fmtNum(best.beta[i + 1], 3)}×${nameOf(id)}</code>`).join(" + ")}
+          ${best.beta[0] >= 0 ? "+" : "−"} <code>${fmtPct(Math.abs(best.beta[0]), 3)}</code> (intercept)<br>
+          <strong>Entry LONG:</strong> เมื่อ <code>predicted ≥ +${fmtPct(best.thrUp, 2)}</code> → ซื้อ ${followerName} ที่ ${mode === "co" ? "open" : "close"}<br>
+          <strong>Entry SHORT:</strong> เมื่อ <code>predicted ≤ −${fmtPct(best.thrDn, 2)}</code> → ชอร์ท ${followerName} ที่ ${mode === "co" ? "open" : "close"}<br>
+          <strong>Exit:</strong> ${mode === "co" ? "ปิดที่ open (gap-only)" : mode === "oc" ? "ปิดที่ close วันเดียวกัน (intraday)" : "ปิดที่ close วันถัดไป"}<br>
+          <strong>No-trade:</strong> ถ้า prediction อยู่ในช่วง <code>(−${fmtPct(best.thrDn, 2)}, +${fmtPct(best.thrUp, 2)})</code> ไม่เทรด<br>
+          <strong>Costs:</strong> ${costBps} bps ต่อ round-trip · <strong>Sizing:</strong> ทุ่มเงินทั้งหมด (1× equity)<br>
+          <strong>Thresholds tuned:</strong> บน train set เท่านั้น (70% ของ ${aligned.length} วัน) — test ด้านล่างคือ OOS ${aligned.length - split} วัน
+        </div>
+      </div>`;
+
+    const realSimBox = `
+      <div class="chart"><h3>Realistic backtest · OOS · starting 10,000</h3>
+        <div class="stats" style="margin-bottom:10px">
+          <div class="stat"><div class="l">Final equity</div><div class="v ${fullEquity >= START ? "pos" : "neg"}">${fullEquity.toFixed(0)}</div><div class="s">${fmtPct(fullEquity / START - 1, 1)}</div></div>
+          <div class="stat"><div class="l">Trades</div><div class="v">${trades.length}</div><div class="s">over ${aligned.length - split} days</div></div>
+          <div class="stat"><div class="l">Win rate</div><div class="v">${fmtPct(wins / Math.max(trades.length, 1), 1)}</div><div class="s">${wins}W / ${losses}L</div></div>
+          <div class="stat"><div class="l">Profit factor</div><div class="v ${profitFactor >= 1 ? "pos" : "neg"}">${fmtNum(profitFactor, 2)}</div><div class="s">Σwin / Σloss</div></div>
+          <div class="stat"><div class="l">Avg win</div><div class="v pos">${fmtPct(wins ? sumWin / wins : 0, 2)}</div><div class="s">per trade</div></div>
+          <div class="stat"><div class="l">Avg loss</div><div class="v neg">${fmtPct(losses ? sumLoss / losses : 0, 2)}</div><div class="s">per trade</div></div>
+          <div class="stat"><div class="l">Max drawdown</div><div class="v neg">${fmtPct(maxDDd, 1)}</div><div class="s">equity basis</div></div>
+          <div class="stat"><div class="l">OOS Sharpe</div><div class="v ${cls(best.oosSharpe)}">${fmtNum(best.oosSharpe, 2)}</div><div class="s">annualised</div></div>
+        </div>
+        <h3 style="margin-top:14px">Trade log · last ${Math.min(trades.length, 30)} OOS trades</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>Date</th><th>Dir</th><th>Leader moves</th><th>Pred</th><th>Actual</th><th>Net</th><th>Equity</th></tr></thead>
+          <tbody>${logRows || `<tr><td colspan="7" style="color:var(--muted)">No OOS trades — threshold too tight.</td></tr>`}</tbody>
+        </table></div>
+      </div>`;
+
     const tbody = top.map((r, i) => `
       <tr${i === 0 ? ' style="background:var(--panel-2)"' : ''}>
         <td>${i + 1}</td>
@@ -549,7 +669,6 @@ async function runSearch() {
         <td>${r.oosN}</td>
       </tr>`).join("");
 
-    // Best-of-k summary: for each k=1..maxK show the winner.
     const byK = {};
     for (const r of results) if (!byK[r.k] || r.oosSharpe > byK[r.k].oosSharpe) byK[r.k] = r;
     const kSummary = Object.keys(byK).sort().map(k => {
@@ -559,7 +678,7 @@ async function runSearch() {
 
     out.innerHTML = `
       <div class="signal">
-        <div class="h">Best combo (out-of-sample, ${mode}, lag ${lag})</div>
+        <div class="h">Best combo (out-of-sample, ${MODE_LABEL[mode]}, lag ${lag})</div>
         <div class="b">
           <strong>${bestLabel}</strong> → OOS Sharpe <span class="em ${cls(best.oosSharpe)}">${fmtNum(best.oosSharpe, 2)}</span> ·
           hit <span class="em">${fmtPct(best.oosHit, 1)}</span> ·
@@ -569,6 +688,10 @@ async function runSearch() {
           <div style="font-size:.72rem;color:var(--muted);margin-top:2px">Tuned thresholds (train-only): ${thrInfo} · cost ${costBps}bps</div>
         </div>
       </div>
+
+      ${strategyBox}
+      ${latestBreakdown}
+      ${realSimBox}
 
       <div class="chart"><h3>Best signal by combo size k</h3>
         <div class="screener-table"><table>
