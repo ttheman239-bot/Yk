@@ -90,8 +90,9 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
     <div class="ctl"><label>Follower (target)</label><select id="xFollower"></select></div>
     <div class="ctl"><label>Max combo size</label><select id="xMaxK"><option>1</option><option>2</option><option selected>3</option><option>4</option></select></div>
     <div class="ctl"><label>Lag (days)</label><input id="xLag" type="number" value="1" min="1" max="5" /></div>
-    <div class="ctl"><label>Follower return</label><select id="xMode"><option value="co" selected>Close → Open (gap)</option><option value="cc">Close → Close</option><option value="oc">Open → Close</option></select></div>
-    <div class="ctl"><label>Threshold %</label><input id="xThr" type="number" value="0" step="0.1" /></div>
+    <div class="ctl"><label>Follower return</label><select id="xMode"><option value="oc" selected>Open → Close (intraday)</option><option value="co">Close → Open (gap)</option><option value="cc">Close → Close</option></select></div>
+    <div class="ctl"><label>Threshold strategy</label><select id="xThrMode"><option value="tune" selected>Auto-tune on train</option><option value="freq">Trade frequently (thr=0)</option><option value="manual">Manual</option></select></div>
+    <div class="ctl"><label>Manual threshold %</label><input id="xThr" type="number" value="0" step="0.05" /></div>
     <div class="ctl"><label>Direction</label><select id="xDir"><option value="auto" selected>Auto (pick best on train)</option><option value="both">Both (long + short)</option><option value="long">LONG only</option><option value="short">SHORT only</option></select></div>
     <div class="ctl"><label>Tx cost (bps)</label><input id="xCost" type="number" value="5" step="1" min="0" /></div>
     <div class="ctl"><label>Window (years)</label><input id="xYears" type="number" value="5" min="1" max="7" /></div>

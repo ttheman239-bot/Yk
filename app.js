@@ -245,6 +245,56 @@ function svgLine(points, w, h, color) {
     </svg>`;
 }
 
+// 4D+ parallel-coordinates chart: each trade drawn as a polyline across the leader
+// axes plus prediction and actual follower-return axes. Wins are bright-coloured,
+// misses dim; long trades green, short trades red. Lets you see visually which
+// leader combinations lead to profitable follower outcomes.
+function svgParallelCoords(trades, axisLabels, getRow, w, h) {
+  if (!trades.length) return `<div style="color:var(--muted);font-size:.8rem">No trades to plot.</div>`;
+  const n = axisLabels.length;
+  const pad = 36;
+  const rowH = h - 2 * pad;
+  const plotW = w - 2 * pad;
+  // Compute per-axis min/max
+  const ranges = axisLabels.map((_, ai) => {
+    let mn = Infinity, mx = -Infinity;
+    for (const t of trades) {
+      const v = getRow(t)[ai];
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+    if (!isFinite(mn)) { mn = -0.01; mx = 0.01; }
+    if (mn === mx) { mn -= 0.005; mx += 0.005; }
+    return { mn, mx };
+  });
+  const xOf = i => pad + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  const yOf = (ai, v) => pad + rowH * (1 - (v - ranges[ai].mn) / (ranges[ai].mx - ranges[ai].mn));
+  const axes = axisLabels.map((lab, i) => `
+    <line x1="${xOf(i)}" y1="${pad}" x2="${xOf(i)}" y2="${pad + rowH}" stroke="rgba(255,255,255,.2)"/>
+    <line x1="${xOf(i)}" y1="${yOf(i, 0)}" x2="${xOf(i) + 4}" y2="${yOf(i, 0)}" stroke="rgba(255,255,255,.4)"/>
+    <text x="${xOf(i)}" y="${pad - 8}" fill="rgba(232,236,255,.8)" font-size="9" text-anchor="middle">${lab}</text>
+    <text x="${xOf(i)}" y="${pad - 20}" fill="rgba(255,255,255,.35)" font-size="7" text-anchor="middle">${fmtPct(ranges[i].mx, 1)}</text>
+    <text x="${xOf(i)}" y="${pad + rowH + 12}" fill="rgba(255,255,255,.35)" font-size="7" text-anchor="middle">${fmtPct(ranges[i].mn, 1)}</text>
+  `).join("");
+  const polys = trades.map(t => {
+    const row = getRow(t);
+    const pts = row.map((v, i) => `${xOf(i).toFixed(1)},${yOf(i, v).toFixed(1)}`).join(" ");
+    const side = t.side || 0;
+    const actual = row[row.length - 1];
+    const hit = (side > 0 && actual > 0) || (side < 0 && actual < 0);
+    const baseColor = side > 0 ? "74,222,128" : side < 0 ? "248,113,113" : "142,156,196";
+    const alpha = hit ? 0.55 : 0.15;
+    return `<polyline points="${pts}" fill="none" stroke="rgba(${baseColor},${alpha})" stroke-width="1"/>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${h}">${axes}${polys}</svg>
+    <div style="font-size:.7rem;color:var(--muted);margin-top:6px;text-align:center">
+      <span style="color:var(--green)">━</span> LONG wins ·
+      <span style="color:var(--green);opacity:.4">━</span> LONG misses ·
+      <span style="color:var(--red)">━</span> SHORT wins ·
+      <span style="color:var(--red);opacity:.4">━</span> SHORT misses
+    </div>`;
+}
+
 function svgScatter(pairs, mode, reg, w, h) {
   if (!pairs.length) return "";
   const xs = pairs.map(p => p.rL * 100);
@@ -461,6 +511,12 @@ function alignMulti(follower, leaders, lag) {
       leaderVals[id] = lRet[id][idx];
     }
     if (!complete) continue;
+    // Inject the follower's own morning gap as a virtual leader so regression can
+    // discover gap-fade / gap-continue patterns (critical for intraday open→close).
+    leaderVals["__self_gap"] = rF_co;
+    // Follower's prior intraday move — observable before today's close.
+    leaderVals["__prev_oc"] = j >= 2 && F[j - 2].c > 0 && F[j - 1].o > 0
+      ? F[j - 1].c / F[j - 1].o - 1 : 0;
     out.push({ dF, rF_cc, rF_oc, rF_co, lr: leaderVals });
   }
   return out;
@@ -487,6 +543,7 @@ async function runSearch() {
   const years = Math.max(1, parseFloat(document.getElementById("xYears").value) || 5);
   const costBps = Math.max(0, parseFloat(document.getElementById("xCost").value) || 0);
   const dirChoice = document.getElementById("xDir").value; // "auto" | "both" | "long" | "short"
+  const thrMode = document.getElementById("xThrMode").value; // "tune" | "freq" | "manual"
   try {
     const F = await loadSeries(followerId, years);
     const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
@@ -495,11 +552,20 @@ async function runSearch() {
     const aligned = alignMulti(F, leaderData, lag);
     if (aligned.length < 100) throw new Error(`Only ${aligned.length} aligned rows — try lowering window`);
 
+    // Virtual leaders: follower's own features that are observable BEFORE the target return
+    // (self-gap at open, previous-day intraday at close). These power the intraday model.
+    const virtualLeaders = mode === "oc"
+      ? [
+          { id: "__self_gap", name: `${F.name} gap`, role: "leader" },
+          { id: "__prev_oc",  name: `${F.name} prev intraday`, role: "leader" },
+        ]
+      : [];
+    const candidatePool = [...leaderList, ...virtualLeaders];
+    const leaderIds = candidatePool.map(l => l.id);
+
     const y = aligned.map(r => mode === "oc" ? r.rF_oc : mode === "co" ? r.rF_co : r.rF_cc);
     // 70/30 train/test split
     const split = Math.floor(aligned.length * 0.7);
-
-    const leaderIds = leaderList.map(l => l.id);
     const results = [];
 
     for (let k = 1; k <= Math.min(maxK, leaderIds.length, 5); k++) {
@@ -516,11 +582,16 @@ async function runSearch() {
         const dirCandidates = dirChoice === "auto" ? ["both", "long", "short"] : [dirChoice];
         let bestOnTrain = null;
         for (const d of dirCandidates) {
-          // Tune threshold per direction on TRAIN set — no look-ahead.
+          // Threshold choice depends on strategy:
+          //  tune   → scan 0-3% on TRAIN set (no look-ahead), pick best asymmetric
+          //  freq   → force 0 for frequent trading (every prediction fires)
+          //  manual → use user-supplied thr as symmetric cutoff
           let tu = thr, td = thr;
-          if (thr === 0) {
+          if (thrMode === "tune") {
             const tune = scanThresholds(aligned.slice(0, split), predIn, mode, costBps, d);
             if (tune.bestAsym) { tu = tune.bestAsym.up; td = tune.bestAsym.dn; }
+          } else if (thrMode === "freq") {
+            tu = 0; td = 0;
           }
           const trBt = backtestEx(aligned.slice(0, split), predIn, mode, { thrUp: tu, thrDn: td, costBps, direction: d });
           if (!bestOnTrain || trBt.sharpe > bestOnTrain.trBt.sharpe) bestOnTrain = { direction: d, tu, td, trBt };
@@ -547,7 +618,11 @@ async function runSearch() {
     const top = results.slice(0, 20);
     if (!top.length) { out.innerHTML = `<div class="err">No viable combinations.</div>`; return; }
 
-    const nameOf = id => (manifest.symbols.find(s => s.id === id) || {}).name || id;
+    const nameOf = id => {
+      const v = virtualLeaders.find(v => v.id === id);
+      if (v) return v.name;
+      return (manifest.symbols.find(s => s.id === id) || {}).name || id;
+    };
 
     // Headline best combo details.
     const best = top[0];
@@ -724,6 +799,16 @@ async function runSearch() {
 
       ${strategyBox}
       ${latestBreakdown}
+
+      <div class="chart"><h3>4D parallel-coords · ${best.combo.length + 2} axes per trade · OOS ${trades.length} trades</h3>
+        ${svgParallelCoords(
+          trades,
+          [...best.combo.map(nameOf), "Predicted", "Actual"],
+          t => [...t.contribs.map(c => c.leaderRet), t.pred, t.rF],
+          360, 220
+        )}
+      </div>
+
       ${realSimBox}
 
       <div class="chart"><h3>Best signal by combo size k</h3>
