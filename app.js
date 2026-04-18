@@ -30,6 +30,69 @@ function sortRows(rows) {
   return rows.slice().sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
 }
 
+// Cash-equity session hours for every follower we model, so the Live dashboard
+// can flag markets that are about to open in the user's local time.
+const MARKET_HOURS = {
+  "^set":   { tz: "Asia/Bangkok",       sessions: [["10:00","12:30"],["14:30","16:30"]], days: [1,2,3,4,5] },
+  "^nkx":   { tz: "Asia/Tokyo",         sessions: [["09:00","11:30"],["12:30","15:00"]], days: [1,2,3,4,5] },
+  "^hsi":   { tz: "Asia/Hong_Kong",     sessions: [["09:30","12:00"],["13:00","16:00"]], days: [1,2,3,4,5] },
+  "^kospi": { tz: "Asia/Seoul",         sessions: [["09:00","15:30"]],                   days: [1,2,3,4,5] },
+  "^sti":   { tz: "Asia/Singapore",     sessions: [["09:00","12:00"],["13:00","17:00"]], days: [1,2,3,4,5] },
+  "^twse":  { tz: "Asia/Taipei",        sessions: [["09:00","13:30"]],                   days: [1,2,3,4,5] },
+  "^shc":   { tz: "Asia/Shanghai",      sessions: [["09:30","11:30"],["13:00","15:00"]], days: [1,2,3,4,5] },
+  "^axjo":  { tz: "Australia/Sydney",   sessions: [["10:00","16:00"]],                   days: [1,2,3,4,5] },
+  "^nsei":  { tz: "Asia/Kolkata",       sessions: [["09:15","15:30"]],                   days: [1,2,3,4,5] },
+  "^dax":   { tz: "Europe/Berlin",      sessions: [["09:00","17:30"]],                   days: [1,2,3,4,5] },
+  "^ftm":   { tz: "Europe/London",      sessions: [["08:00","16:30"]],                   days: [1,2,3,4,5] },
+};
+
+function zonedNow(tz) {
+  const f = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12: false, weekday: "short", hour: "2-digit", minute: "2-digit", year: "numeric", month: "2-digit", day: "2-digit" });
+  const parts = Object.fromEntries(f.formatToParts(new Date()).map(p => [p.type, p.value]));
+  const wdMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  let h = parseInt(parts.hour, 10); if (h === 24) h = 0;
+  const m = parseInt(parts.minute, 10);
+  return { weekday: wdMap[parts.weekday], h, m, minutes: h * 60 + m, hms: `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}` };
+}
+
+function parseHM(hm) { const [h, m] = hm.split(":").map(Number); return h * 60 + m; }
+
+function marketStatus(followerId) {
+  const mk = MARKET_HOURS[followerId];
+  if (!mk) return null;
+  const z = zonedNow(mk.tz);
+  const today = mk.days.includes(z.weekday);
+  let status = "closed";
+  let mins = 0; // minutes until next transition (open if closed, close if open)
+  let transition = "opens";
+  if (today) {
+    for (const [o, c] of mk.sessions) {
+      const op = parseHM(o), cl = parseHM(c);
+      if (z.minutes >= op && z.minutes < cl) {
+        status = "open";
+        mins = cl - z.minutes;
+        transition = "closes";
+        return { status, mins, transition, local: z.hms, tz: mk.tz };
+      }
+    }
+    // not in any session today — is the next open later today?
+    for (const [o] of mk.sessions) {
+      const op = parseHM(o);
+      if (z.minutes < op) {
+        mins = op - z.minutes;
+        return { status: "closed", mins, transition: "opens", local: z.hms, tz: mk.tz };
+      }
+    }
+  }
+  // Look forward day by day for next open
+  let add = 24 * 60 - z.minutes;
+  let wd = (z.weekday + 1) % 7;
+  while (!mk.days.includes(wd)) { add += 24 * 60; wd = (wd + 1) % 7; }
+  add += parseHM(mk.sessions[0][0]);
+  return { status: "closed", mins: add, transition: "opens", local: z.hms, tz: mk.tz };
+}
+
+
 // Solve A x = b via Gauss-Jordan elimination with partial pivoting.
 function solveLinear(A, b) {
   const n = A.length;
@@ -830,6 +893,149 @@ async function runSearch() {
   }
 }
 
+// Scan all followers, per-follower run mini auto-search, return best combo per follower
+// with its latest prediction so a Live dashboard can show currently-actionable signals.
+async function scanFollower(followerId, opts) {
+  const { mode, lag, years, costBps, maxK, dirChoice, thrMode, manualThr } = opts;
+  const F = await loadSeries(followerId, years);
+  const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
+  const leaderData = {};
+  for (const l of leaderList) leaderData[l.id] = await loadSeries(l.id, years);
+  const aligned = alignMulti(F, leaderData, lag);
+  if (aligned.length < 100) return null;
+  const y = aligned.map(r => mode === "oc" ? r.rF_oc : mode === "co" ? r.rF_co : r.rF_cc);
+  const split = Math.floor(aligned.length * 0.7);
+  const virtualLeaders = mode === "oc"
+    ? [{ id: "__self_gap", name: `${F.name} gap`, role: "leader" },
+       { id: "__prev_oc", name: `${F.name} prev intraday`, role: "leader" }]
+    : [];
+  const candidateIds = [...leaderList.map(l => l.id), ...virtualLeaders.map(v => v.id)];
+
+  let best = null;
+  for (let k = 1; k <= Math.min(maxK, candidateIds.length, 5); k++) {
+    for (const combo of combinations(candidateIds, k)) {
+      const X = aligned.map(r => [1, ...combo.map(id => r.lr[id])]);
+      const fit = multiRegress(X.slice(0, split), y.slice(0, split));
+      if (!fit) continue;
+      const predIn = fit.pred;
+      const predOut = X.slice(split).map(row => row.reduce((s, v, i) => s + v * fit.beta[i], 0));
+      const dirList = dirChoice === "auto" ? ["both", "long", "short"] : [dirChoice];
+      let trainPick = null;
+      for (const d of dirList) {
+        let tu = manualThr, td = manualThr;
+        if (thrMode === "tune") {
+          const t = scanThresholds(aligned.slice(0, split), predIn, mode, costBps, d);
+          if (t.bestAsym) { tu = t.bestAsym.up; td = t.bestAsym.dn; }
+        } else if (thrMode === "freq") { tu = 0; td = 0; }
+        const trBt = backtestEx(aligned.slice(0, split), predIn, mode, { thrUp: tu, thrDn: td, costBps, direction: d });
+        if (!trainPick || trBt.sharpe > trainPick.trSharpe) trainPick = { d, tu, td, trSharpe: trBt.sharpe };
+      }
+      const btOut = backtestEx(aligned.slice(split), predOut, mode, { thrUp: trainPick.tu, thrDn: trainPick.td, costBps, direction: trainPick.d });
+      if (!best || btOut.sharpe > best.oosSharpe) {
+        const latest = aligned[aligned.length - 1];
+        const latestRow = [1, ...combo.map(id => latest.lr[id])];
+        const latestPred = latestRow.reduce((s, v, i) => s + v * fit.beta[i], 0);
+        let latestSide = 0;
+        const canLong = trainPick.d !== "short", canShort = trainPick.d !== "long";
+        if (latestPred > 0 && latestPred >= trainPick.tu && canLong) latestSide = 1;
+        else if (latestPred < 0 && -latestPred >= trainPick.td && canShort) latestSide = -1;
+        best = {
+          followerId, followerName: F.name, combo, beta: fit.beta,
+          direction: trainPick.d, thrUp: trainPick.tu, thrDn: trainPick.td,
+          oosSharpe: btOut.sharpe, oosHit: btOut.hitRate, oosN: btOut.trades, oosEq: btOut.finalV, oosMaxDD: btOut.maxDD,
+          latest: { dF: latest.dF, pred: latestPred, side: latestSide, leaders: combo.map((id, i) => ({
+            id, name: (virtualLeaders.find(v => v.id === id) || manifest.symbols.find(s => s.id === id) || { name: id }).name,
+            leaderRet: latest.lr[id], beta: fit.beta[i + 1], contrib: fit.beta[i + 1] * latest.lr[id],
+          })) },
+          virtualLeaders,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+async function runLive() {
+  const out = document.getElementById("lOut");
+  out.innerHTML = `<div class="loading">Scanning followers — this can take 10-30s…</div>`;
+  const mode = document.getElementById("lMode").value;
+  const lag = Math.max(1, parseInt(document.getElementById("lLag").value) || 1);
+  const maxK = Math.max(1, parseInt(document.getElementById("lMaxK").value) || 2);
+  const dirChoice = document.getElementById("lDir").value;
+  const thrMode = document.getElementById("lThr").value;
+  const costBps = Math.max(0, parseFloat(document.getElementById("lCost").value) || 5);
+  const years = Math.max(1, parseFloat(document.getElementById("lYears").value) || 5);
+  const manualThr = 0;
+  const onlyActionable = document.getElementById("lActionable").checked;
+
+  const followers = manifest.symbols.filter(s => s.role === "follower" || s.role === "both");
+  const results = [];
+  for (const f of followers) {
+    try {
+      const r = await scanFollower(f.id, { mode, lag, years, costBps, maxK, dirChoice, thrMode, manualThr });
+      if (!r) continue;
+      r.market = marketStatus(f.id);
+      results.push(r);
+    } catch (e) { /* skip broken follower */ }
+  }
+
+  const filtered = onlyActionable ? results.filter(r => r.latest.side !== 0 && r.oosSharpe > 0) : results;
+
+  // Sort: OPEN first, then earliest-to-open, then highest Sharpe
+  filtered.sort((a, b) => {
+    const ao = a.market && a.market.status === "open" ? 0 : (a.market ? a.market.mins : 1e9);
+    const bo = b.market && b.market.status === "open" ? 0 : (b.market ? b.market.mins : 1e9);
+    if (ao !== bo) return ao - bo;
+    return b.oosSharpe - a.oosSharpe;
+  });
+
+  if (!filtered.length) { out.innerHTML = `<div class="err">No results (try lowering Max K or disable 'Actionable only').</div>`; return; }
+
+  const rows = filtered.map(r => {
+    const st = r.market;
+    const statusLabel = st ? (st.status === "open" ? `🟢 OPEN · closes in ${fmtDurMin(st.mins)}` : `🔴 opens in ${fmtDurMin(st.mins)}`) : "?";
+    const statusCls = st && st.status === "open" ? "pos" : "";
+    const sideLabel = r.latest.side > 0 ? `<span class="pos">LONG</span>` : r.latest.side < 0 ? `<span class="neg">SHORT</span>` : `<span style="color:var(--muted)">—</span>`;
+    const leaderSummary = r.latest.leaders.map(l => `${l.name.split(" ")[0]} ${fmtPct(l.leaderRet, 1)}`).join(" · ");
+    return `
+      <tr>
+        <td><strong>${r.followerName}</strong><div style="font-size:.65rem;color:var(--muted)">${r.followerId}</div></td>
+        <td class="${statusCls}">${statusLabel}<div style="font-size:.65rem;color:var(--muted)">${st ? st.local + " " + st.tz.split("/").pop() : "—"}</div></td>
+        <td>${sideLabel}<div style="font-size:.65rem;color:var(--muted)">thr up≥${fmtPct(r.thrUp, 2)} dn≤−${fmtPct(r.thrDn, 2)}</div></td>
+        <td class="${cls(r.latest.pred)}">${fmtPct(r.latest.pred, 2)}</td>
+        <td class="${cls(r.oosSharpe)}">${fmtNum(r.oosSharpe, 2)}</td>
+        <td>${fmtPct(r.oosHit, 0)}</td>
+        <td>${r.oosN}</td>
+        <td style="font-size:.7rem;color:var(--muted);white-space:normal;max-width:280px">${leaderSummary}<div style="font-size:.65rem">${r.combo.map(id => (r.virtualLeaders.find(v => v.id === id) || manifest.symbols.find(s => s.id === id) || {name: id}).name).join(" + ")} · ${r.direction}</div></td>
+      </tr>`;
+  }).join("");
+
+  const currentLocal = new Date().toLocaleTimeString([], { hour12: false });
+
+  out.innerHTML = `
+    <div class="signal">
+      <div class="h">Live scan · ${new Date().toLocaleString()} · ${filtered.length}/${results.length} followers</div>
+      <div class="b" style="font-size:.82rem">
+        ผลจาก train 70% / test 30% per follower · mode=${mode} · lag=${lag} · maxK=${maxK} · dir=${dirChoice} · thr=${thrMode} · cost ${costBps}bps<br>
+        เรียงตาม: ตลาดที่กำลังจะเปิดก่อน → OOS Sharpe สูงสุด
+      </div>
+    </div>
+    <div class="screener-table"><table>
+      <thead><tr><th>Follower</th><th>Market status</th><th>Signal</th><th>Predicted</th><th>OOS Sharpe</th><th>OOS Hit</th><th>N</th><th>Best combo · leader moves</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="hint" style="margin-top:10px">
+      <strong>วิธีอ่าน:</strong> <code>Signal</code> = ทิศทางที่ model แนะนำสำหรับ trade ใหม่ที่ ${mode === "oc" ? "ตลาดเปิด" : mode === "co" ? "ตลาดเปิด (gap)" : "ตลาดปิด"} วันนี้ · <code>Predicted</code> คือ % ที่ model คาดการณ์ · <code>OOS Sharpe/Hit</code> = ประสิทธิภาพของ model บน test set (30% หลังสุด) · <code>Best combo</code> = leaders ที่ regression เลือก · <code>leader moves</code> = % การเคลื่อนไหวของ leaders ที่ใช้ predict
+    </div>`;
+}
+
+function fmtDurMin(m) {
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60), r = m % 60;
+  if (h < 24) return `${h}h ${r}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
 async function runScreener() {
   const out = document.getElementById("sOut");
   out.innerHTML = `<div class="loading">Loading data for all followers…</div>`;
@@ -920,6 +1126,8 @@ async function boot() {
   document.getElementById("pGo").addEventListener("click", runPair);
   document.getElementById("sGo").addEventListener("click", runScreener);
   document.getElementById("xGo").addEventListener("click", runSearch);
+  const lGo = document.getElementById("lGo");
+  if (lGo) lGo.addEventListener("click", runLive);
   // Re-run on control change for snappier UX
   ["pLeader", "pFollower", "pLag", "pThrUp", "pThrDn", "pFilter", "pMode", "pDir", "pCost", "pYears"].forEach(id => {
     const el = document.getElementById(id);

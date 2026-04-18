@@ -63,12 +63,28 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
 </header>
 
 <div class="tabs">
-  <button class="tab active" data-view="pair">Pair</button>
+  <button class="tab active" data-view="live">Live</button>
+  <button class="tab" data-view="pair">Pair</button>
   <button class="tab" data-view="screen">Screener</button>
   <button class="tab" data-view="search">Auto-Search</button>
 </div>
 
-<div class="view active" id="view-pair">
+<div class="view active" id="view-live">
+  <div class="controls">
+    <div class="ctl"><label>Mode</label><select id="lMode"><option value="oc" selected>Open → Close (intraday)</option><option value="co">Close → Open (gap)</option><option value="cc">Close → Close</option></select></div>
+    <div class="ctl"><label>Max combo size</label><select id="lMaxK"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option></select></div>
+    <div class="ctl"><label>Lag</label><input id="lLag" type="number" value="1" min="1" max="5" /></div>
+    <div class="ctl"><label>Direction</label><select id="lDir"><option value="auto" selected>Auto</option><option value="long">LONG only</option><option value="short">SHORT only</option><option value="both">Both</option></select></div>
+    <div class="ctl"><label>Threshold</label><select id="lThr"><option value="tune" selected>Auto-tune</option><option value="freq">Trade frequent</option></select></div>
+    <div class="ctl"><label>Tx cost (bps)</label><input id="lCost" type="number" value="5" step="1" min="0" /></div>
+    <div class="ctl"><label>Window (years)</label><input id="lYears" type="number" value="5" min="1" max="7" /></div>
+    <div class="ctl"><label style="display:flex;align-items:center;gap:6px"><input id="lActionable" type="checkbox" checked style="width:auto"/> <span>Actionable only (signal fired, Sharpe&gt;0)</span></label></div>
+    <button class="go" id="lGo">Scan live signals</button>
+  </div>
+  <div id="lOut"></div>
+</div>
+
+<div class="view" id="view-pair">
   <div class="controls">
     <div class="ctl"><label>Leader (ช่วงนำ)</label><select id="pLeader"></select></div>
     <div class="ctl"><label>Follower (ตามทีหลัง)</label><select id="pFollower"></select></div>
@@ -88,7 +104,7 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
 <div class="view" id="view-search">
   <div class="controls">
     <div class="ctl"><label>Follower (target)</label><select id="xFollower"></select></div>
-    <div class="ctl"><label>Max combo size</label><select id="xMaxK"><option>1</option><option>2</option><option selected>3</option><option>4</option></select></div>
+    <div class="ctl"><label>Max combo size</label><select id="xMaxK"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></div>
     <div class="ctl"><label>Lag (days)</label><input id="xLag" type="number" value="1" min="1" max="5" /></div>
     <div class="ctl"><label>Follower return</label><select id="xMode"><option value="oc" selected>Open → Close (intraday)</option><option value="co">Close → Open (gap)</option><option value="cc">Close → Close</option></select></div>
     <div class="ctl"><label>Threshold strategy</label><select id="xThrMode"><option value="tune" selected>Auto-tune on train</option><option value="freq">Trade frequently (thr=0)</option><option value="manual">Manual</option></select></div>
