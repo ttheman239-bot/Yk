@@ -1372,6 +1372,338 @@ async function runTrace() {
   }
 }
 
+// ============================================================================
+// MIRAGE — Multi-scale Iterated Recursive Anticipation & Gradient Ensemble
+// Own design (see README). Seven pillars, pure JS:
+//   1. RED  (Recursive Envelope Decomposition)       — price → 8-vector/day
+//   2. PCT  (Phase Coherence Tensor)                 — 3D leader-follower-scale
+//   3. TAS  (Tribe Amplitude Spectrum)               — rolling vol per scale
+//   4. K*   (Anticipation-Depth Estimator)            — three regime invariants
+//   5. ARD  (Anti-Reflexive Direction mapper)         — state → sign/size
+//   6. HMK  (Holographic Memory Kernel)               — resonance-peaked memory
+//   7. GEM  (Gradient Ensemble over K-manifold)       — final position
+// ============================================================================
+
+const MIRAGE_SCALES = [1, 2, 4, 8, 16, 32, 64, 128];
+
+// Pillar 1 — RED
+function redDecompose(closes, scales = MIRAGE_SCALES) {
+  const T = closes.length;
+  const pressures = scales.map(() => new Array(T).fill(0));
+  for (let si = 0; si < scales.length; si++) {
+    const s = scales[si];
+    for (let t = 0; t < T; t++) {
+      const start = Math.max(0, t - s + 1);
+      let hi = -Infinity, lo = Infinity;
+      for (let k = start; k <= t; k++) {
+        if (closes[k] > hi) hi = closes[k];
+        if (closes[k] < lo) lo = closes[k];
+      }
+      const range = hi - lo;
+      pressures[si][t] = range > 0 ? (2 * closes[t] - hi - lo) / range : 0;
+    }
+  }
+  return pressures; // [scale][t] ∈ [-1, 1]
+}
+
+// Pillar 2 — Phase Coherence Tensor (one pair).
+// Returns {coh[s], lag[s]}: coherence and optimal lead-lag for each scale.
+function phaseCoherenceTensor(pressI, pressJ, maxLag = 5) {
+  const S = pressI.length;
+  const T = pressI[0].length;
+  const coh = new Array(S).fill(0.5);
+  const lag = new Array(S).fill(0);
+  for (let s = 0; s < S; s++) {
+    let bestC = -1, bestL = 0;
+    for (let L = -maxLag; L <= maxLag; L++) {
+      let agree = 0, total = 0;
+      const tStart = Math.max(0, L);
+      const tEnd = T - Math.max(0, -L);
+      for (let t = tStart; t < tEnd; t++) {
+        const a = Math.sign(pressI[s][t - L]);
+        const b = Math.sign(pressJ[s][t]);
+        if (a !== 0 && b !== 0) { total++; if (a === b) agree++; }
+      }
+      const c = total >= 50 ? agree / total : 0.5;
+      if (c > bestC) { bestC = c; bestL = L; }
+    }
+    coh[s] = bestC; lag[s] = bestL;
+  }
+  return { coh, lag };
+}
+
+// Pillar 3 — Tribe Amplitude Spectrum. Rolling std of pressure at each scale.
+function tribeAmplitude(pressures, window = 60) {
+  const S = pressures.length, T = pressures[0].length;
+  const amp = pressures.map(() => new Array(T).fill(0));
+  for (let s = 0; s < S; s++) {
+    const arr = pressures[s];
+    let sum = 0, sum2 = 0;
+    for (let t = 0; t < T; t++) {
+      sum += arr[t]; sum2 += arr[t] * arr[t];
+      if (t >= window) { sum -= arr[t - window]; sum2 -= arr[t - window] * arr[t - window]; }
+      const n = Math.min(window, t + 1);
+      const m = sum / n;
+      amp[s][t] = Math.sqrt(Math.max(0, sum2 / n - m * m));
+    }
+  }
+  return amp;
+}
+
+// Pillar 4 — K* Anticipation Depth. Three invariants → 0, 1, 2, 3 state.
+function estimateKStar(tribeAmp, returns, window = 30) {
+  const T = returns.length;
+  const K = new Array(T).fill(0);
+  const invariants = new Array(T).fill(null);
+  for (let t = window * 2; t < T; t++) {
+    // (A) Scale migration: ratio of slow-to-fast tribe amplitude growing = anticipation deepening
+    const fast = (tribeAmp[1][t] + tribeAmp[2][t]) / 2;
+    const slow = (tribeAmp[5][t] + tribeAmp[6][t]) / 2;
+    const fastP = (tribeAmp[1][t - window] + tribeAmp[2][t - window]) / 2;
+    const slowP = (tribeAmp[5][t - window] + tribeAmp[6][t - window]) / 2;
+    const migration = (slow / (fast + 1e-6)) - (slowP / (fastP + 1e-6));
+    // (B) Return autocorrelation → negative = fade/anti-reflexive phase
+    const slice = returns.slice(t - window, t);
+    const m = slice.reduce((s, v) => s + v, 0) / slice.length;
+    let num = 0, den = 0;
+    for (let i = 1; i < slice.length; i++) num += (slice[i] - m) * (slice[i - 1] - m);
+    for (let i = 0; i < slice.length; i++) den += (slice[i] - m) ** 2;
+    const autoCorr = den > 0 ? num / den : 0;
+    // (C) Excess kurtosis — bimodal blow-up regime marker
+    let m2 = 0, m4 = 0;
+    for (const v of slice) { m2 += (v - m) ** 2; m4 += (v - m) ** 4; }
+    m2 /= slice.length; m4 /= slice.length;
+    const exKurt = m2 > 0 ? m4 / (m2 * m2) - 3 : 0;
+    // Combine into K
+    let k;
+    if (exKurt > 3 && Math.abs(autoCorr) > 0.15) k = 3;
+    else if (autoCorr < -0.08 && migration > 0) k = 2;
+    else if (Math.abs(autoCorr) < 0.08 && migration > 0) k = 1;
+    else k = 0;
+    K[t] = k;
+    invariants[t] = { migration, autoCorr, exKurt };
+  }
+  return { K, invariants };
+}
+
+// Pillar 5 — Anti-Reflexive Direction. Maps (K, Kprev, rawSignal) → sized signal.
+function antiReflexiveDirection(K, Kprev, rawSignal) {
+  let mult = 0;
+  switch (K) {
+    case 0: mult = +1.0; break;   // trend-follow news
+    case 1: mult = +0.3; break;   // reduce, crowded
+    case 2: mult = -1.0; break;   // fade the consensus
+    case 3: mult = 0.0;  break;   // sit out — unstable
+  }
+  // Transition boost: moving to new K is the alpha, not the state
+  if (Kprev !== null && Kprev !== K && K !== 3) mult *= 1.5;
+  return mult * rawSignal;
+}
+
+// Pillar 6 — Holographic Memory Kernel. Gaussian-weighted sum of past pressures,
+// peaked at the dominant tribe scale so memory "resonates" with the active horizon.
+function holographicMemory(pressures, tribeAmpAtT, t, maxLookback = 64) {
+  const S = pressures.length;
+  // dominant scale = argmax of current tribe amplitude
+  let dom = 0, best = -Infinity;
+  for (let s = 0; s < S; s++) if (tribeAmpAtT[s] > best) { best = tribeAmpAtT[s]; dom = s; }
+  const center = Math.min(Math.pow(2, dom), maxLookback - 1);
+  const sigma = Math.max(center / 2, 1);
+  const mem = new Array(S).fill(0);
+  let Wsum = 0;
+  for (let tau = 1; tau <= maxLookback && t - tau >= 0; tau++) {
+    const w = Math.exp(-((tau - center) ** 2) / (2 * sigma * sigma));
+    Wsum += w;
+    for (let s = 0; s < S; s++) mem[s] += w * pressures[s][t - tau];
+  }
+  if (Wsum > 0) for (let s = 0; s < S; s++) mem[s] /= Wsum;
+  return { memory: mem, dominantScale: dom };
+}
+
+// Pillar 7 — runMirage. Full backtest.
+async function runMirage() {
+  const out = document.getElementById("mOut");
+  out.innerHTML = `<div class="loading">Running MIRAGE pipeline (7 pillars)…</div>`;
+  const followerId = document.getElementById("mFollower").value;
+  const mode = document.getElementById("mMode").value;
+  const years = Math.max(2, parseFloat(document.getElementById("mYears").value) || 5);
+  const costBps = Math.max(0, parseFloat(document.getElementById("mCost").value) || 5);
+  const topK = Math.max(2, Math.min(6, parseInt(document.getElementById("mTopK").value) || 3));
+
+  try {
+    const F = await loadSeries(followerId, years);
+    const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
+    const leaderData = {};
+    for (const l of leaderList) leaderData[l.id] = await loadSeries(l.id, years);
+
+    const closesF = F.rows.map(r => r.c);
+    const returnsF = F.rows.map((r, i) => i === 0 ? 0 : r.c / F.rows[i - 1].c - 1);
+
+    // Pillar 1: RED for follower and each leader, aligned on follower's dates
+    const pressF = redDecompose(closesF);
+    const leaderPress = {};
+    for (const l of leaderList) {
+      const dateIdx = {};
+      F.rows.forEach((r, i) => dateIdx[r.d] = i);
+      const aligned = new Array(F.rows.length).fill(null);
+      let lastC = null;
+      for (const r of l.rows) {
+        const i = dateIdx[r.d];
+        if (i !== undefined) { aligned[i] = r.c; lastC = r.c; }
+      }
+      // forward-fill for holiday-skew
+      for (let i = 0; i < aligned.length; i++) if (aligned[i] == null) aligned[i] = lastC || closesF[i];
+      leaderPress[l.id] = redDecompose(aligned);
+    }
+
+    // Pillar 2: pick top-K leaders by total phase coherence (average across scales, positive lag)
+    const leaderScores = {};
+    for (const l of leaderList) {
+      const { coh, lag } = phaseCoherenceTensor(leaderPress[l.id], pressF, 5);
+      // reward leaders that lead (lag > 0 in our convention = leader earlier)
+      let score = 0;
+      for (let s = 0; s < coh.length; s++) if (lag[s] > 0) score += (coh[s] - 0.5) * Math.log2(MIRAGE_SCALES[s] + 1);
+      leaderScores[l.id] = { score, coh, lag };
+    }
+    const ranked = Object.entries(leaderScores).sort((a, b) => b[1].score - a[1].score);
+    const selected = ranked.slice(0, topK).map(([id]) => id);
+    const nameOf = id => (manifest.symbols.find(s => s.id === id) || { name: id }).name;
+
+    // Pillar 3: tribe amplitude of follower
+    const tribeF = tribeAmplitude(pressF, 60);
+
+    // Pillar 4: K* per day
+    const { K, invariants } = estimateKStar(tribeF, returnsF, 30);
+
+    // Pillar 5+6+7: per-day signal and backtest
+    const T = F.rows.length;
+    const signals = new Array(T).fill(0);
+    const positions = new Array(T).fill(0);
+    const dominantScale = new Array(T).fill(0);
+
+    for (let t = 130; t < T - 1; t++) {
+      // Pillar 6: memory kernel for follower
+      const tribeAtT = tribeF.map(a => a[t]);
+      const { memory, dominantScale: dom } = holographicMemory(pressF, tribeAtT, t);
+      dominantScale[t] = dom;
+
+      // Raw signal: sum over selected leaders of (coherence-weighted leader pressure at dominant scale)
+      let raw = 0, wSum = 0;
+      for (const id of selected) {
+        const lp = leaderPress[id];
+        const { coh, lag } = leaderScores[id];
+        const bestS = dom;
+        const L = Math.max(0, lag[bestS] || 1);
+        const leaderPressAtT = t - L >= 0 ? lp[bestS][t - L] : 0;
+        const w = Math.max(0, coh[bestS] - 0.5);
+        raw += w * leaderPressAtT;
+        wSum += w;
+      }
+      if (wSum > 0) raw /= wSum;
+
+      // Blend with memory alignment (if memory at dominant scale agrees with raw, boost)
+      const memAlign = Math.sign(memory[dom]) * Math.sign(raw);
+      raw *= (1 + 0.3 * memAlign);
+
+      // Pillar 5: anti-reflexive sign
+      const pos = antiReflexiveDirection(K[t], t > 130 ? K[t - 1] : null, raw);
+      signals[t] = raw;
+      positions[t] = pos;
+    }
+
+    // Backtest
+    const cost = costBps / 1e4;
+    const equity = [{ d: F.rows[0].d, v: 1 }];
+    let peak = 1, maxDD = 0;
+    let trades = 0, hits = 0, sumRet = 0, sumRet2 = 0;
+    for (let t = 130; t < T - 1; t++) {
+      const size = Math.max(-1, Math.min(1, positions[t])); // clip to [-1,1]
+      const nextRet = mode === "oc" ? (F.rows[t + 1].c / F.rows[t + 1].o - 1)
+                     : mode === "co" ? (F.rows[t + 1].o / F.rows[t].c - 1)
+                     : (F.rows[t + 1].c / F.rows[t].c - 1);
+      let dayRet = 0;
+      if (Math.abs(size) >= 0.1) {
+        dayRet = size * nextRet - 2 * cost * Math.abs(size);
+        trades++;
+        if ((size > 0 && nextRet > 0) || (size < 0 && nextRet < 0)) hits++;
+        sumRet += dayRet; sumRet2 += dayRet * dayRet;
+      }
+      const v = equity[equity.length - 1].v * (1 + dayRet);
+      equity.push({ d: F.rows[t + 1].d, v });
+      if (v > peak) peak = v;
+      maxDD = Math.min(maxDD, (v - peak) / peak);
+    }
+    const avg = trades ? sumRet / trades : 0;
+    const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avg * avg) : 0;
+    const sharpe = std > 0 ? (avg / std) * Math.sqrt(252) : 0;
+
+    // K* timeline
+    const kCounts = [0, 0, 0, 0];
+    for (let t = 60; t < T; t++) kCounts[K[t]]++;
+
+    // Phase coherence heatmap (top-K × 8 scales)
+    const heatCells = selected.map(id => {
+      const { coh } = leaderScores[id];
+      return `<tr><td>${nameOf(id)}</td>${coh.map(c => {
+        const v = Math.max(0, (c - 0.5) * 2);
+        const hue = 140;
+        return `<td style="background:hsl(${hue},70%,${50 - v * 30}%);color:${v > 0.4 ? "#fff" : "#aaa"};text-align:center;font-size:.65rem">${(c * 100).toFixed(0)}</td>`;
+      }).join("")}</tr>`;
+    }).join("");
+
+    out.innerHTML = `
+      <div class="signal">
+        <div class="h">MIRAGE · ${F.name} · ${MODE_LABEL[mode]} · top-${topK} coherent leaders</div>
+        <div class="b">
+          OOS-like full-window backtest: Sharpe <span class="em ${cls(sharpe)}">${fmtNum(sharpe, 2)}</span> ·
+          hit <span class="em">${fmtPct(trades ? hits / trades : 0, 1)}</span> ·
+          equity <span class="em ${equity[equity.length - 1].v >= 1 ? "up" : "dn"}">${fmtNum(equity[equity.length - 1].v, 2)}×</span> ·
+          N=${trades} · maxDD ${fmtPct(maxDD, 1)}
+        </div>
+      </div>
+
+      <div class="chart"><h3>Pillar 2 · Phase Coherence Heatmap (top-${topK} × 8 scales)</h3>
+        <div style="overflow-x:auto"><table style="width:100%;font-size:.7rem;border-collapse:collapse">
+          <thead><tr><th style="text-align:left">Leader</th>${MIRAGE_SCALES.map(s => `<th style="text-align:center">${s}d</th>`).join("")}</tr></thead>
+          <tbody>${heatCells}</tbody>
+        </table></div>
+        <div style="font-size:.7rem;color:var(--muted);margin-top:6px">แต่ละช่อง = % agreement ของ phase ที่ scale นั้น (50% = สุ่ม, 100% = sync สมบูรณ์)</div>
+      </div>
+
+      <div class="chart"><h3>Pillar 4 · K* (Anticipation Depth) distribution</h3>
+        <div class="stats">
+          <div class="stat"><div class="l">K=0 News</div><div class="v">${kCounts[0]}</div><div class="s">${fmtPct(kCounts[0] / T, 1)}</div></div>
+          <div class="stat"><div class="l">K=1 Neutral</div><div class="v">${kCounts[1]}</div><div class="s">${fmtPct(kCounts[1] / T, 1)}</div></div>
+          <div class="stat"><div class="l">K=2 Fade</div><div class="v">${kCounts[2]}</div><div class="s">${fmtPct(kCounts[2] / T, 1)}</div></div>
+          <div class="stat"><div class="l">K=3 Chaos</div><div class="v">${kCounts[3]}</div><div class="s">${fmtPct(kCounts[3] / T, 1)}</div></div>
+        </div>
+        <div style="font-size:.7rem;color:var(--muted);margin-top:6px">K* = ระดับ meta ของตลาด. MIRAGE เทรด LONG ที่ K=0, ชอร์ทที่ K=2, ลดขนาดที่ K=1, ไม่เทรดที่ K=3. K-transition boost 1.5× เมื่อเปลี่ยนระดับ.</div>
+      </div>
+
+      <div class="chart"><h3>Pillars 5-7 · Equity curve (anti-reflexive with holographic memory)</h3>
+        ${svgLine(equity.slice(130), 360, 140, "#7ecbff")}
+      </div>
+
+      <div class="stats">
+        <div class="stat"><div class="l">Sharpe</div><div class="v ${cls(sharpe)}">${fmtNum(sharpe, 2)}</div><div class="s">annualised</div></div>
+        <div class="stat"><div class="l">Hit rate</div><div class="v">${fmtPct(trades ? hits / trades : 0, 1)}</div><div class="s">N=${trades}</div></div>
+        <div class="stat"><div class="l">Final equity</div><div class="v ${equity[equity.length - 1].v >= 1 ? "pos" : "neg"}">${fmtNum(equity[equity.length - 1].v, 2)}×</div><div class="s">${fmtPct(equity[equity.length - 1].v - 1, 1)}</div></div>
+        <div class="stat"><div class="l">Max DD</div><div class="v neg">${fmtPct(maxDD, 1)}</div><div class="s">peak→trough</div></div>
+        <div class="stat"><div class="l">Avg trade</div><div class="v ${cls(avg)}">${fmtPct(avg, 3)}</div><div class="s">per trade</div></div>
+        <div class="stat"><div class="l">Top causal leaders</div><div class="v" style="font-size:.85rem">${selected.map(nameOf).join(" + ")}</div><div class="s">ordered by Σ coh × log(s)</div></div>
+      </div>
+
+      <div class="hint">
+        <strong>วิธีอ่าน:</strong> MIRAGE ไม่ predict price, predict <strong>reflexivity state K*</strong>
+        แล้ว map เป็น direction: K=0→trend-follow, K=2→fade, transitions ได้ขนาดใหญ่กว่า.
+        Phase coherence tensor บอกว่า leader ไหน sync ที่ scale ใด, memory kernel ใช้ dominant scale
+        เป็น peak ของ resonance กรองสัญญาณเก่าให้ relevant กับ horizon ปัจจุบัน.
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="err">MIRAGE error: ${e.message}</div>`;
+  }
+}
+
 async function runScreener() {
   const out = document.getElementById("sOut");
   out.innerHTML = `<div class="loading">Loading data for all followers…</div>`;
@@ -1445,6 +1777,8 @@ async function boot() {
     fillSelect(document.getElementById("xFollower"), manifest.symbols, s => s.role !== "leader");
     const tFoll = document.getElementById("tFollower");
     if (tFoll) fillSelect(tFoll, manifest.symbols, s => s.role !== "leader");
+    const mFoll = document.getElementById("mFollower");
+    if (mFoll) fillSelect(mFoll, manifest.symbols, s => s.role !== "leader");
     document.getElementById("pLeader").value = "^spx";
     document.getElementById("pFollower").value = "^set";
     document.getElementById("sLeader").value = "^spx";
@@ -1471,6 +1805,12 @@ async function boot() {
     tGo.addEventListener("click", runTrace);
     const tf = document.getElementById("tFollower");
     if (tf && manifest && manifest.symbols.find(s => s.id === "^nkx")) tf.value = "^nkx";
+  }
+  const mGo = document.getElementById("mGo");
+  if (mGo) {
+    mGo.addEventListener("click", runMirage);
+    const mf = document.getElementById("mFollower");
+    if (mf && manifest && manifest.symbols.find(s => s.id === "^kospi")) mf.value = "^kospi";
   }
   // Re-run on control change for snappier UX
   ["pLeader", "pFollower", "pLag", "pThrUp", "pThrDn", "pFilter", "pMode", "pDir", "pCost", "pYears"].forEach(id => {

@@ -68,6 +68,7 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
   <button class="tab" data-view="screen">Screener</button>
   <button class="tab" data-view="search">Auto-Search</button>
   <button class="tab" data-view="trace">TRACE</button>
+  <button class="tab" data-view="mirage">MIRAGE</button>
 </div>
 
 <div class="view active" id="view-live">
@@ -113,6 +114,18 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
     <button class="go" id="tGo">Run TRACE-Lite</button>
   </div>
   <div id="tOut"></div>
+</div>
+
+<div class="view" id="view-mirage">
+  <div class="controls">
+    <div class="ctl"><label>Follower (target)</label><select id="mFollower"></select></div>
+    <div class="ctl"><label>Mode</label><select id="mMode"><option value="oc">Open → Close</option><option value="co" selected>Close → Open (gap)</option><option value="cc">Close → Close</option></select></div>
+    <div class="ctl"><label>Top-K coherent leaders</label><input id="mTopK" type="number" value="3" min="2" max="6" /></div>
+    <div class="ctl"><label>Tx cost (bps)</label><input id="mCost" type="number" value="5" step="1" min="0" /></div>
+    <div class="ctl"><label>Window (years)</label><input id="mYears" type="number" value="5" min="2" max="7" /></div>
+    <button class="go" id="mGo">Run MIRAGE (7 pillars)</button>
+  </div>
+  <div id="mOut"></div>
 </div>
 
 <div class="view" id="view-search">
