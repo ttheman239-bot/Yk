@@ -1036,6 +1036,342 @@ function fmtDurMin(m) {
   return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
+// ============================================================================
+// TRACE — Topological Regime-Adaptive Causal Ensemble (lite, JS-only)
+// Pipeline:
+//   1. Transfer Entropy:   pick leaders by information-theoretic causality
+//      (Schreiber 2000), not just correlation. Asymmetric → detects direction.
+//   2. Regime detection:   K-means over (20d-vol, |20d-return|) splits history
+//      into low-vol/mid/high-vol regimes — proxy for topological phase.
+//   3. Path signatures:    level-2 truncated signature over selected leaders'
+//      rolling path (Lyons rough-path). Captures order-of-events, not just
+//      average return — e.g. "X up then down" ≠ "X down then up".
+//   4. Ridge regression per regime:  fit a separate linear model in each
+//      regime (train-only). Predict with the model of the current regime.
+//   5. Threshold-tuned backtest: same engine as Auto-Search, so results are
+//      directly comparable to the baseline models.
+// ============================================================================
+
+// Discretize a continuous series into K equal-frequency bins (quantile bucketing).
+function discretize(series, k) {
+  const sorted = series.slice().sort((a, b) => a - b);
+  const edges = [];
+  for (let i = 1; i < k; i++) edges.push(sorted[Math.floor((i / k) * sorted.length)]);
+  return series.map(v => {
+    for (let i = 0; i < edges.length; i++) if (v < edges[i]) return i;
+    return edges.length;
+  });
+}
+
+// Transfer entropy TE(X -> Y): how much knowing X_{t-L} reduces uncertainty of
+// Y_{t+1} given Y_t. Uses 3-bin discrete estimator with Laplace smoothing.
+function transferEntropy(X, Y, lag = 1, bins = 3) {
+  const n = Math.min(X.length, Y.length) - lag - 1;
+  if (n < 60) return 0;
+  const xd = discretize(X.slice(0, n + lag), bins);
+  const yd = discretize(Y.slice(0, n + lag + 1), bins);
+  // count p(y_next, y_curr, x_lag)
+  const pJoint = new Map();   // key = "y1,y0,x" -> count
+  const pYY = new Map();      // "y1,y0"
+  const pYpY = new Map();     // "y0,x" marginal for denominator shape
+  const pY = new Map();       // "y0"
+  for (let t = 0; t < n; t++) {
+    const x = xd[t];
+    const y0 = yd[t + lag];
+    const y1 = yd[t + lag + 1];
+    const k1 = `${y1},${y0},${x}`;
+    const k2 = `${y1},${y0}`;
+    const k3 = `${y0},${x}`;
+    const k4 = `${y0}`;
+    pJoint.set(k1, (pJoint.get(k1) || 0) + 1);
+    pYY.set(k2, (pYY.get(k2) || 0) + 1);
+    pYpY.set(k3, (pYpY.get(k3) || 0) + 1);
+    pY.set(k4, (pY.get(k4) || 0) + 1);
+  }
+  let te = 0;
+  for (const [k, c] of pJoint) {
+    const [y1, y0, x] = k.split(",").map(Number);
+    const pABC = c / n;
+    const pBC = pYpY.get(`${y0},${x}`) / n;
+    const pAB = pYY.get(`${y1},${y0}`) / n;
+    const pB = pY.get(`${y0}`) / n;
+    const num = pABC / (pBC || 1e-12);
+    const den = pAB / (pB || 1e-12);
+    if (num > 0 && den > 0) te += pABC * Math.log2(num / den);
+  }
+  return Math.max(0, te);
+}
+
+// 1-D or 2-D K-means, nClusters = 3 (low/mid/high vol regime). Lloyd iterations.
+function kmeans(points, k, maxIter = 50) {
+  const n = points.length, d = points[0].length;
+  // init: pick k evenly spaced after sort by norm (deterministic enough)
+  const idxs = points.map((_, i) => i).sort((a, b) => {
+    const na = points[a].reduce((s, x) => s + x * x, 0);
+    const nb = points[b].reduce((s, x) => s + x * x, 0);
+    return na - nb;
+  });
+  const centers = [];
+  for (let i = 0; i < k; i++) centers.push(points[idxs[Math.floor((i + 0.5) * n / k)]].slice());
+  const labels = new Array(n).fill(0);
+  for (let iter = 0; iter < maxIter; iter++) {
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      let best = 0, bestD = Infinity;
+      for (let c = 0; c < k; c++) {
+        let dist = 0;
+        for (let j = 0; j < d; j++) { const dd = points[i][j] - centers[c][j]; dist += dd * dd; }
+        if (dist < bestD) { bestD = dist; best = c; }
+      }
+      if (labels[i] !== best) { labels[i] = best; changed = true; }
+    }
+    // recompute centers
+    const sums = Array.from({ length: k }, () => new Array(d).fill(0));
+    const counts = new Array(k).fill(0);
+    for (let i = 0; i < n; i++) {
+      counts[labels[i]]++;
+      for (let j = 0; j < d; j++) sums[labels[i]][j] += points[i][j];
+    }
+    for (let c = 0; c < k; c++) if (counts[c]) for (let j = 0; j < d; j++) centers[c][j] = sums[c][j] / counts[c];
+    if (!changed) break;
+  }
+  // sort clusters by first dim (so label 0 = smallest vol, etc.)
+  const order = centers.map((_, c) => c).sort((a, b) => centers[a][0] - centers[b][0]);
+  const remap = new Array(k);
+  order.forEach((c, i) => remap[c] = i);
+  return { labels: labels.map(l => remap[l]), centers: order.map(c => centers[c]) };
+}
+
+// Level-2 truncated path signature of a d-dim path (array of length T of vectors of length d).
+// Returns d + d*d features: level-1 increments + level-2 iterated integrals (approximated).
+function pathSignatureLv2(path) {
+  if (!path.length) return [];
+  const d = path[0].length;
+  const T = path.length;
+  const lv1 = new Array(d).fill(0);
+  for (let i = 0; i < d; i++) lv1[i] = path[T - 1][i] - path[0][i];
+  const lv2 = Array.from({ length: d }, () => new Array(d).fill(0));
+  // Approximate ∫ X^i dX^j using left-Riemann on increments
+  const cumX = Array.from({ length: d }, () => 0);
+  for (let t = 0; t < T - 1; t++) {
+    for (let i = 0; i < d; i++) {
+      for (let j = 0; j < d; j++) {
+        const dXj = path[t + 1][j] - path[t][j];
+        const Xi = cumX[i]; // left endpoint
+        lv2[i][j] += Xi * dXj;
+      }
+      cumX[i] += path[t + 1][i] - path[t][i];
+    }
+  }
+  const out = [...lv1];
+  for (let i = 0; i < d; i++) for (let j = 0; j < d; j++) out.push(lv2[i][j]);
+  return out;
+}
+
+// Ridge regression: β = (XᵀX + λI)⁻¹ Xᵀy. Uses existing solveLinear.
+function ridgeRegress(X, y, lambda) {
+  const n = X.length, k = X[0].length;
+  const xtx = Array.from({ length: k }, () => new Array(k).fill(0));
+  const xty = new Array(k).fill(0);
+  for (let i = 0; i < n; i++) for (let a = 0; a < k; a++) {
+    xty[a] += X[i][a] * y[i];
+    for (let b = 0; b < k; b++) xtx[a][b] += X[i][a] * X[i][b];
+  }
+  for (let a = 0; a < k; a++) xtx[a][a] += lambda;
+  const beta = solveLinear(xtx, xty);
+  return beta;
+}
+
+async function runTrace() {
+  const out = document.getElementById("tOut");
+  out.innerHTML = `<div class="loading">Running TRACE pipeline… (TE graph + regimes + path signatures + per-regime ridge)</div>`;
+  const followerId = document.getElementById("tFollower").value;
+  const mode = document.getElementById("tMode").value;
+  const years = Math.max(2, parseFloat(document.getElementById("tYears").value) || 5);
+  const topK = Math.max(2, Math.min(8, parseInt(document.getElementById("tTopK").value) || 4));
+  const pathLen = Math.max(5, Math.min(30, parseInt(document.getElementById("tPathLen").value) || 10));
+  const nRegimes = 3;
+  const costBps = Math.max(0, parseFloat(document.getElementById("tCost").value) || 5);
+  const lambda = 0.01;
+
+  try {
+    const F = await loadSeries(followerId, years);
+    const leaderList = manifest.symbols.filter(s => s.id !== followerId && s.role !== "follower");
+    const leaderData = {};
+    for (const l of leaderList) leaderData[l.id] = await loadSeries(l.id, years);
+    const aligned = alignMulti(F, leaderData, 1);
+    if (aligned.length < 200) throw new Error(`Only ${aligned.length} aligned rows`);
+    const y = aligned.map(r => mode === "oc" ? r.rF_oc : mode === "co" ? r.rF_co : r.rF_cc);
+
+    // ============ Step 1: Transfer Entropy of each leader → follower ============
+    const leaderIds = leaderList.map(l => l.id);
+    if (mode === "oc") { leaderIds.push("__self_gap"); leaderIds.push("__prev_oc"); }
+    const teScores = {};
+    for (const id of leaderIds) {
+      const xs = aligned.map(r => r.lr[id]).filter(v => isFinite(v));
+      if (xs.length !== aligned.length) continue;
+      teScores[id] = transferEntropy(xs, y, 1, 3);
+    }
+    const ranked = Object.entries(teScores).sort((a, b) => b[1] - a[1]);
+    const selected = ranked.slice(0, topK).map(([id]) => id);
+    const nameOf = id => id === "__self_gap" ? `${F.name} gap`
+      : id === "__prev_oc" ? `${F.name} prev intraday`
+      : (manifest.symbols.find(s => s.id === id) || { name: id }).name;
+
+    // ============ Step 2: Regime detection (K-means on rolling vol + |ret|) ============
+    const regimePts = [];
+    const regimeWin = 20;
+    for (let i = 0; i < y.length; i++) {
+      const start = Math.max(0, i - regimeWin);
+      const win = y.slice(start, i + 1);
+      const m = win.reduce((s, v) => s + v, 0) / win.length;
+      const vol = Math.sqrt(win.reduce((s, v) => s + (v - m) ** 2, 0) / win.length);
+      regimePts.push([vol, Math.abs(m)]);
+    }
+    const km = kmeans(regimePts, nRegimes);
+    const regimes = km.labels;
+
+    // ============ Step 3: Path signature features per day ============
+    const featPerDay = [];
+    for (let i = 0; i < aligned.length; i++) {
+      const start = Math.max(0, i - pathLen + 1);
+      const path = [];
+      for (let t = start; t <= i; t++) path.push(selected.map(id => aligned[t].lr[id]));
+      // pad to ensure at least pathLen points by prepending zeros
+      while (path.length < pathLen) path.unshift(path[0] || selected.map(() => 0));
+      featPerDay.push(pathSignatureLv2(path));
+    }
+
+    // ============ Step 4: Fit ridge per regime on TRAIN only (70/30) ============
+    const split = Math.floor(aligned.length * 0.7);
+    const perRegimeBeta = {};
+    for (let r = 0; r < nRegimes; r++) {
+      const idx = [];
+      for (let i = 0; i < split; i++) if (regimes[i] === r) idx.push(i);
+      if (idx.length < 30) { perRegimeBeta[r] = null; continue; }
+      const Xr = idx.map(i => [1, ...featPerDay[i]]);
+      const yr = idx.map(i => y[i]);
+      perRegimeBeta[r] = ridgeRegress(Xr, yr, lambda);
+    }
+
+    // ============ Step 5: Predict + backtest OOS ============
+    const preds = new Array(aligned.length).fill(0);
+    for (let i = 0; i < aligned.length; i++) {
+      const beta = perRegimeBeta[regimes[i]];
+      if (!beta) { preds[i] = 0; continue; }
+      const row = [1, ...featPerDay[i]];
+      preds[i] = row.reduce((s, v, k) => s + v * beta[k], 0);
+    }
+
+    const predIn = preds.slice(0, split);
+    const predOut = preds.slice(split);
+    const rowsIn = aligned.slice(0, split);
+    const rowsOut = aligned.slice(split);
+
+    // Tune threshold + direction on TRAIN only
+    let bestTrain = null;
+    for (const d of ["both", "long", "short"]) {
+      const tune = scanThresholds(rowsIn, predIn, mode, costBps, d);
+      const tu = tune.bestAsym ? tune.bestAsym.up : 0;
+      const td = tune.bestAsym ? tune.bestAsym.dn : 0;
+      const trBt = backtestEx(rowsIn, predIn, mode, { thrUp: tu, thrDn: td, costBps, direction: d });
+      if (!bestTrain || trBt.sharpe > bestTrain.tr) bestTrain = { d, tu, td, tr: trBt.sharpe };
+    }
+    const btOut = backtestEx(rowsOut, predOut, mode, { thrUp: bestTrain.tu, thrDn: bestTrain.td, costBps, direction: bestTrain.d });
+
+    // Baseline for comparison: plain multi-regression on same top-K leaders, no signatures, no regimes
+    const Xbase = aligned.map(r => [1, ...selected.map(id => r.lr[id])]);
+    const baseFit = multiRegress(Xbase.slice(0, split), y.slice(0, split));
+    const basePreds = Xbase.slice(split).map(row => row.reduce((s, v, i) => s + v * baseFit.beta[i], 0));
+    let baseTrain = null;
+    for (const d of ["both", "long", "short"]) {
+      const tune = scanThresholds(aligned.slice(0, split), Xbase.slice(0, split).map(row => row.reduce((s, v, i) => s + v * baseFit.beta[i], 0)), mode, costBps, d);
+      const tu = tune.bestAsym ? tune.bestAsym.up : 0;
+      const td = tune.bestAsym ? tune.bestAsym.dn : 0;
+      const trBt = backtestEx(aligned.slice(0, split), Xbase.slice(0, split).map(row => row.reduce((s, v, i) => s + v * baseFit.beta[i], 0)), mode, { thrUp: tu, thrDn: td, costBps, direction: d });
+      if (!baseTrain || trBt.sharpe > baseTrain.tr) baseTrain = { d, tu, td, tr: trBt.sharpe };
+    }
+    const baseOut = backtestEx(rowsOut, basePreds, mode, { thrUp: baseTrain.tu, thrDn: baseTrain.td, costBps, direction: baseTrain.d });
+
+    // Regime counts
+    const regimeCounts = [0, 0, 0];
+    for (const r of regimes) regimeCounts[r]++;
+    const regimeLabels = ["Low-vol", "Mid-vol", "High-vol"];
+
+    // TE ranking table
+    const teRows = ranked.slice(0, 10).map(([id, te], i) => `
+      <tr${i < topK ? ' style="background:var(--panel-2)"' : ''}>
+        <td>${i + 1}</td>
+        <td>${nameOf(id)}<div style="font-size:.65rem;color:var(--muted)">${id}</div></td>
+        <td class="${cls(te)}">${fmtNum(te, 4)} bits</td>
+        <td>${i < topK ? '✓ selected' : ''}</td>
+      </tr>`).join("");
+
+    out.innerHTML = `
+      <div class="signal">
+        <div class="h">TRACE-Lite · ${F.name} · ${MODE_LABEL[mode]} · top-${topK} causal leaders · ${pathLen}d path</div>
+        <div class="b">
+          TRACE OOS: Sharpe <span class="em ${cls(btOut.sharpe)}">${fmtNum(btOut.sharpe, 2)}</span>,
+          hit <span class="em">${fmtPct(btOut.hitRate, 1)}</span>,
+          equity <span class="em ${btOut.finalV >= 1 ? "up" : "dn"}">${fmtNum(btOut.finalV, 2)}×</span>,
+          N=${btOut.trades}, dir=${bestTrain.d}
+          <br>Baseline (plain regression) OOS: Sharpe ${fmtNum(baseOut.sharpe, 2)}, hit ${fmtPct(baseOut.hitRate, 1)}, equity ${fmtNum(baseOut.finalV, 2)}× — TRACE lift:
+          <span class="em ${btOut.sharpe > baseOut.sharpe ? "up" : "dn"}">${fmtNum(btOut.sharpe - baseOut.sharpe, 2)}</span>
+        </div>
+      </div>
+
+      <div class="chart"><h3>Step 1 · Transfer Entropy ranking (causal leaders of ${F.name})</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>#</th><th>Leader</th><th>TE (bits)</th><th>Selected?</th></tr></thead>
+          <tbody>${teRows}</tbody>
+        </table></div>
+        <div style="font-size:.7rem;color:var(--muted);margin-top:6px">TE = bits of uncertainty about ${F.name}'s next move that are resolved by knowing the leader's previous move, beyond what ${F.name}'s own history already tells you. Non-linear, directional.</div>
+      </div>
+
+      <div class="chart"><h3>Step 2 · Regime split (K-means on 20d vol + |mean|)</h3>
+        <div class="stats">
+          ${regimeCounts.map((c, i) => `
+            <div class="stat"><div class="l">${regimeLabels[i]}</div><div class="v">${c} days</div><div class="s">${fmtPct(c / regimes.length, 1)}</div></div>
+          `).join("")}
+        </div>
+        <div style="font-size:.7rem;color:var(--muted);margin-top:6px">Ridge model is fit separately per regime on TRAIN, then predictions use the model matching the current day's regime.</div>
+      </div>
+
+      <div class="chart"><h3>Step 3 · Path signatures</h3>
+        <div style="font-size:.8rem">
+          Level-2 truncated signature of the ${pathLen}-day path of ${topK} top-causal leaders →
+          <strong>${topK + topK * topK}</strong> features per day (${topK} increments + ${topK}² iterated integrals).
+          Encodes sequence of events, not just endpoints.
+        </div>
+      </div>
+
+      <div class="chart"><h3>Step 4-5 · OOS Equity curve (TRACE vs baseline)</h3>
+        ${svgLine(btOut.equity, 360, 140, "#4ade80")}
+      </div>
+
+      <div class="stats">
+        <div class="stat"><div class="l">TRACE OOS Sharpe</div><div class="v ${cls(btOut.sharpe)}">${fmtNum(btOut.sharpe, 2)}</div><div class="s">dir=${bestTrain.d}</div></div>
+        <div class="stat"><div class="l">Baseline Sharpe</div><div class="v ${cls(baseOut.sharpe)}">${fmtNum(baseOut.sharpe, 2)}</div><div class="s">plain multi-reg</div></div>
+        <div class="stat"><div class="l">TRACE hit</div><div class="v">${fmtPct(btOut.hitRate, 1)}</div><div class="s">N=${btOut.trades}</div></div>
+        <div class="stat"><div class="l">Baseline hit</div><div class="v">${fmtPct(baseOut.hitRate, 1)}</div><div class="s">N=${baseOut.trades}</div></div>
+        <div class="stat"><div class="l">TRACE equity</div><div class="v ${btOut.finalV >= 1 ? "pos" : "neg"}">${fmtNum(btOut.finalV, 2)}×</div><div class="s">${fmtPct(btOut.finalV - 1, 1)}</div></div>
+        <div class="stat"><div class="l">Baseline equity</div><div class="v ${baseOut.finalV >= 1 ? "pos" : "neg"}">${fmtNum(baseOut.finalV, 2)}×</div><div class="s">${fmtPct(baseOut.finalV - 1, 1)}</div></div>
+        <div class="stat"><div class="l">TRACE max DD</div><div class="v neg">${fmtPct(btOut.maxDD, 1)}</div><div class="s">peak→trough</div></div>
+        <div class="stat"><div class="l">Baseline max DD</div><div class="v neg">${fmtPct(baseOut.maxDD, 1)}</div><div class="s">peak→trough</div></div>
+      </div>
+
+      <div class="hint">
+        <strong>Pipeline:</strong> Transfer-Entropy leader selection → K-means regime split →
+        level-2 path signature features → per-regime Ridge → asym threshold tuning on train → OOS backtest.
+        แต่ละชั้นแก้ปัญหาคนละมิติของ basic regression: (1) TE = เลือก causal ไม่ใช่ correlated,
+        (2) regime = one-model-fits-all ไม่ใช่, (3) signature = จับ order-of-events,
+        (4) ridge = จัดการ multicollinearity ของ signature features.
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="err">Error: ${e.message}</div>`;
+  }
+}
+
 async function runScreener() {
   const out = document.getElementById("sOut");
   out.innerHTML = `<div class="loading">Loading data for all followers…</div>`;
@@ -1107,6 +1443,8 @@ async function boot() {
     fillSelect(document.getElementById("pFollower"), manifest.symbols, s => s.role !== "leader");
     fillSelect(document.getElementById("sLeader"), manifest.symbols, s => s.role !== "follower");
     fillSelect(document.getElementById("xFollower"), manifest.symbols, s => s.role !== "leader");
+    const tFoll = document.getElementById("tFollower");
+    if (tFoll) fillSelect(tFoll, manifest.symbols, s => s.role !== "leader");
     document.getElementById("pLeader").value = "^spx";
     document.getElementById("pFollower").value = "^set";
     document.getElementById("sLeader").value = "^spx";
@@ -1128,6 +1466,12 @@ async function boot() {
   document.getElementById("xGo").addEventListener("click", runSearch);
   const lGo = document.getElementById("lGo");
   if (lGo) lGo.addEventListener("click", runLive);
+  const tGo = document.getElementById("tGo");
+  if (tGo) {
+    tGo.addEventListener("click", runTrace);
+    const tf = document.getElementById("tFollower");
+    if (tf && manifest && manifest.symbols.find(s => s.id === "^nkx")) tf.value = "^nkx";
+  }
   // Re-run on control change for snappier UX
   ["pLeader", "pFollower", "pLag", "pThrUp", "pThrDn", "pFilter", "pMode", "pDir", "pCost", "pYears"].forEach(id => {
     const el = document.getElementById(id);

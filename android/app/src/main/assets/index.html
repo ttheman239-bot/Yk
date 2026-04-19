@@ -67,6 +67,7 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
   <button class="tab" data-view="pair">Pair</button>
   <button class="tab" data-view="screen">Screener</button>
   <button class="tab" data-view="search">Auto-Search</button>
+  <button class="tab" data-view="trace">TRACE</button>
 </div>
 
 <div class="view active" id="view-live">
@@ -99,6 +100,19 @@ code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;font-siz
     <button class="go" id="pGo">Analyze</button>
   </div>
   <div id="pOut"></div>
+</div>
+
+<div class="view" id="view-trace">
+  <div class="controls">
+    <div class="ctl"><label>Follower (target)</label><select id="tFollower"></select></div>
+    <div class="ctl"><label>Mode</label><select id="tMode"><option value="oc">Open → Close</option><option value="co" selected>Close → Open (gap)</option><option value="cc">Close → Close</option></select></div>
+    <div class="ctl"><label>Top-K causal leaders</label><input id="tTopK" type="number" value="4" min="2" max="8" /></div>
+    <div class="ctl"><label>Path length (days)</label><input id="tPathLen" type="number" value="10" min="5" max="30" /></div>
+    <div class="ctl"><label>Tx cost (bps)</label><input id="tCost" type="number" value="5" step="1" min="0" /></div>
+    <div class="ctl"><label>Window (years)</label><input id="tYears" type="number" value="5" min="2" max="7" /></div>
+    <button class="go" id="tGo">Run TRACE-Lite</button>
+  </div>
+  <div id="tOut"></div>
 </div>
 
 <div class="view" id="view-search">
