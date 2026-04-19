@@ -1542,17 +1542,24 @@ async function runMirage() {
     // Pillar 1: RED for follower and each leader, aligned on follower's dates
     const pressF = redDecompose(closesF);
     const leaderPress = {};
+    const dateIdx = {};
+    F.rows.forEach((r, i) => dateIdx[r.d] = i);
     for (const l of leaderList) {
-      const dateIdx = {};
-      F.rows.forEach((r, i) => dateIdx[r.d] = i);
+      const lSeries = leaderData[l.id];
       const aligned = new Array(F.rows.length).fill(null);
-      let lastC = null;
-      for (const r of l.rows) {
+      for (const r of lSeries.rows) {
         const i = dateIdx[r.d];
-        if (i !== undefined) { aligned[i] = r.c; lastC = r.c; }
+        if (i !== undefined) aligned[i] = r.c;
       }
-      // forward-fill for holiday-skew
-      for (let i = 0; i < aligned.length; i++) if (aligned[i] == null) aligned[i] = lastC || closesF[i];
+      // Running forward-fill (carry last-known leader close forward)
+      let running = null;
+      for (let i = 0; i < aligned.length; i++) {
+        if (aligned[i] != null) running = aligned[i];
+        else if (running != null) aligned[i] = running;
+      }
+      // Back-fill leading nulls with first known value
+      const first = aligned.find(v => v != null);
+      for (let i = 0; i < aligned.length; i++) if (aligned[i] == null) aligned[i] = first || closesF[i];
       leaderPress[l.id] = redDecompose(aligned);
     }
 
