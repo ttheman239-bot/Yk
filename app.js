@@ -1523,7 +1523,7 @@ function holographicMemory(pressures, tribeAmpAtT, t, maxLookback = 64) {
 // Pillar 7 — runMirage. Full backtest.
 async function runMirage() {
   const out = document.getElementById("mOut");
-  out.innerHTML = `<div class="loading">Running MIRAGE pipeline (7 pillars)…</div>`;
+  out.innerHTML = `<div class="loading">Running MIRAGE v2 pipeline (7 pillars, return-based regression)…</div>`;
   const followerId = document.getElementById("mFollower").value;
   const mode = document.getElementById("mMode").value;
   const years = Math.max(2, parseFloat(document.getElementById("mYears").value) || 5);
@@ -1538,36 +1538,32 @@ async function runMirage() {
 
     const closesF = F.rows.map(r => r.c);
     const returnsF = F.rows.map((r, i) => i === 0 ? 0 : r.c / F.rows[i - 1].c - 1);
+    const T = F.rows.length;
 
-    // Pillar 1: RED for follower and each leader, aligned on follower's dates
+    // ---- Pillar 1: RED of follower + aligned leaders ----
     const pressF = redDecompose(closesF);
     const leaderPress = {};
+    const leaderCloses = {};
     const dateIdx = {};
     F.rows.forEach((r, i) => dateIdx[r.d] = i);
     for (const l of leaderList) {
-      const lSeries = leaderData[l.id];
-      const aligned = new Array(F.rows.length).fill(null);
-      for (const r of lSeries.rows) {
+      const aligned = new Array(T).fill(null);
+      for (const r of leaderData[l.id].rows) {
         const i = dateIdx[r.d];
         if (i !== undefined) aligned[i] = r.c;
       }
-      // Running forward-fill (carry last-known leader close forward)
       let running = null;
-      for (let i = 0; i < aligned.length; i++) {
-        if (aligned[i] != null) running = aligned[i];
-        else if (running != null) aligned[i] = running;
-      }
-      // Back-fill leading nulls with first known value
-      const first = aligned.find(v => v != null);
-      for (let i = 0; i < aligned.length; i++) if (aligned[i] == null) aligned[i] = first || closesF[i];
+      for (let i = 0; i < T; i++) { if (aligned[i] != null) running = aligned[i]; else if (running != null) aligned[i] = running; }
+      const firstVal = aligned.find(v => v != null);
+      for (let i = 0; i < T; i++) if (aligned[i] == null) aligned[i] = firstVal || closesF[i];
+      leaderCloses[l.id] = aligned;
       leaderPress[l.id] = redDecompose(aligned);
     }
 
-    // Pillar 2: pick top-K leaders by total phase coherence (average across scales, positive lag)
+    // ---- Pillar 2: PCT-based leader selection (coherence × log-scale, leading only) ----
     const leaderScores = {};
     for (const l of leaderList) {
       const { coh, lag } = phaseCoherenceTensor(leaderPress[l.id], pressF, 5);
-      // reward leaders that lead (lag > 0 in our convention = leader earlier)
       let score = 0;
       for (let s = 0; s < coh.length; s++) if (lag[s] > 0) score += (coh[s] - 0.5) * Math.log2(MIRAGE_SCALES[s] + 1);
       leaderScores[l.id] = { score, coh, lag };
@@ -1576,135 +1572,214 @@ async function runMirage() {
     const selected = ranked.slice(0, topK).map(([id]) => id);
     const nameOf = id => (manifest.symbols.find(s => s.id === id) || { name: id }).name;
 
-    // Pillar 3: tribe amplitude of follower
+    // ---- Pillar 3: tribe amplitude spectrum ----
     const tribeF = tribeAmplitude(pressF, 60);
 
-    // Pillar 4: K* per day
+    // ---- Pillar 4: K* per day ----
     const { K, invariants } = estimateKStar(tribeF, returnsF, 30);
 
-    // Pillar 5+6+7: per-day signal and backtest
-    const T = F.rows.length;
-    const signals = new Array(T).fill(0);
-    const positions = new Array(T).fill(0);
-    const dominantScale = new Array(T).fill(0);
+    // ---- Build target vector y (next-day follower return under chosen mode) ----
+    const y = new Array(T).fill(0);
+    for (let t = 0; t < T - 1; t++) {
+      y[t] = mode === "oc" ? (F.rows[t + 1].c / F.rows[t + 1].o - 1)
+           : mode === "co" ? (F.rows[t + 1].o / F.rows[t].c - 1)
+           : (F.rows[t + 1].c / F.rows[t].c - 1);
+    }
 
+    // ---- Build feature matrix X ----
+    // [1, leader_ret_1d × topK, follower_pressure_dominant, memory_dominant, tribe_low_vol, tribe_hi_vol]
+    const leaderRet = {};
+    for (const id of selected) {
+      const c = leaderCloses[id];
+      const r = new Array(T).fill(0);
+      for (let t = 1; t < T; t++) if (c[t - 1] > 0) r[t] = c[t] / c[t - 1] - 1;
+      leaderRet[id] = r;
+    }
+    const X = new Array(T).fill(null);
+    const dominantScales = new Array(T).fill(0);
+    const memories = new Array(T).fill(null);
     for (let t = 130; t < T - 1; t++) {
-      // Pillar 6: memory kernel for follower
       const tribeAtT = tribeF.map(a => a[t]);
       const { memory, dominantScale: dom } = holographicMemory(pressF, tribeAtT, t);
-      dominantScale[t] = dom;
-
-      // Raw signal: sum over selected leaders of (coherence-weighted leader pressure at dominant scale)
-      let raw = 0, wSum = 0;
-      for (const id of selected) {
-        const lp = leaderPress[id];
-        const { coh, lag } = leaderScores[id];
-        const bestS = dom;
-        const L = Math.max(0, lag[bestS] || 1);
-        const leaderPressAtT = t - L >= 0 ? lp[bestS][t - L] : 0;
-        const w = Math.max(0, coh[bestS] - 0.5);
-        raw += w * leaderPressAtT;
-        wSum += w;
-      }
-      if (wSum > 0) raw /= wSum;
-
-      // Blend with memory alignment (if memory at dominant scale agrees with raw, boost)
-      const memAlign = Math.sign(memory[dom]) * Math.sign(raw);
-      raw *= (1 + 0.3 * memAlign);
-
-      // Pillar 5: anti-reflexive sign
-      const pos = antiReflexiveDirection(K[t], t > 130 ? K[t - 1] : null, raw);
-      signals[t] = raw;
-      positions[t] = pos;
+      dominantScales[t] = dom;
+      memories[t] = memory;
+      const leaderFeats = selected.map(id => leaderRet[id][t]);
+      const pressDom = pressF[dom][t];
+      const memDom = memory[dom];
+      const tribeLow = tribeF[1][t] + tribeF[2][t];
+      const tribeHi = tribeF[5][t] + tribeF[6][t];
+      X[t] = [1, ...leaderFeats, pressDom, memDom, tribeLow, tribeHi];
     }
 
-    // Backtest
-    const cost = costBps / 1e4;
-    const equity = [{ d: F.rows[0].d, v: 1 }];
-    let peak = 1, maxDD = 0;
-    let trades = 0, hits = 0, sumRet = 0, sumRet2 = 0;
+    // ---- Train/test split (70/30), fit ridge PER K-regime on train only ----
+    const splitIdx = 130 + Math.floor((T - 131) * 0.7);
+    const perKBeta = { 0: null, 1: null, 2: null, 3: null };
+    const perKN = { 0: 0, 1: 0, 2: 0, 3: 0 };
+    for (let k = 0; k < 4; k++) {
+      const Xk = [], yk = [];
+      for (let t = 130; t < splitIdx; t++) if (X[t] && K[t] === k) { Xk.push(X[t]); yk.push(y[t]); }
+      perKN[k] = Xk.length;
+      if (Xk.length >= 30) perKBeta[k] = ridgeRegress(Xk, yk, 0.05);
+    }
+    // Fallback: if a regime has no train samples, use union-fit β as pooled model
+    let pooledBeta = null;
+    {
+      const Xk = [], yk = [];
+      for (let t = 130; t < splitIdx; t++) if (X[t]) { Xk.push(X[t]); yk.push(y[t]); }
+      if (Xk.length >= 30) pooledBeta = ridgeRegress(Xk, yk, 0.05);
+    }
+
+    // ---- Predict on full window (use each day's K's model) ----
+    const preds = new Array(T).fill(0);
     for (let t = 130; t < T - 1; t++) {
-      const size = Math.max(-1, Math.min(1, positions[t])); // clip to [-1,1]
-      const nextRet = mode === "oc" ? (F.rows[t + 1].c / F.rows[t + 1].o - 1)
-                     : mode === "co" ? (F.rows[t + 1].o / F.rows[t].c - 1)
-                     : (F.rows[t + 1].c / F.rows[t].c - 1);
-      let dayRet = 0;
-      if (Math.abs(size) >= 0.1) {
-        dayRet = size * nextRet - 2 * cost * Math.abs(size);
-        trades++;
-        if ((size > 0 && nextRet > 0) || (size < 0 && nextRet < 0)) hits++;
-        sumRet += dayRet; sumRet2 += dayRet * dayRet;
-      }
-      const v = equity[equity.length - 1].v * (1 + dayRet);
-      equity.push({ d: F.rows[t + 1].d, v });
-      if (v > peak) peak = v;
-      maxDD = Math.min(maxDD, (v - peak) / peak);
+      if (!X[t]) continue;
+      const beta = perKBeta[K[t]] || pooledBeta;
+      if (!beta) continue;
+      let p = 0;
+      for (let i = 0; i < X[t].length; i++) p += X[t][i] * beta[i];
+      preds[t] = p;
     }
-    const avg = trades ? sumRet / trades : 0;
-    const std = trades > 1 ? Math.sqrt(sumRet2 / trades - avg * avg) : 0;
-    const sharpe = std > 0 ? (avg / std) * Math.sqrt(252) : 0;
 
-    // K* timeline
+    // ---- Pillar 5: ARD scaling (K-regime × transition boost) applied to prediction ----
+    const adjPreds = new Array(T).fill(0);
+    for (let t = 130; t < T - 1; t++) {
+      let m = 0;
+      switch (K[t]) {
+        case 0: m = 1.0; break;
+        case 1: m = 0.5; break;
+        case 2: m = 1.0; break;
+        case 3: m = 0.0; break;
+      }
+      if (t > 130 && K[t] !== K[t - 1] && K[t] !== 3) m *= 1.3;
+      adjPreds[t] = m * preds[t];
+    }
+
+    // ---- Tune threshold + direction on TRAIN only (no look-ahead) ----
+    const rowsAll = new Array(T).fill(null);
+    for (let t = 130; t < T - 1; t++) rowsAll[t] = { dF: F.rows[t + 1].d, rF_cc: y[t], rF_oc: y[t], rF_co: y[t] };
+    const trainRows = [], trainPreds = [];
+    for (let t = 130; t < splitIdx; t++) if (rowsAll[t]) { trainRows.push(rowsAll[t]); trainPreds.push(adjPreds[t]); }
+    let bestTr = null;
+    for (const d of ["both", "long", "short"]) {
+      const tune = scanThresholds(trainRows, trainPreds, "cc", costBps, d);
+      const tu = tune.bestAsym ? tune.bestAsym.up : 0;
+      const td = tune.bestAsym ? tune.bestAsym.dn : 0;
+      const tr = backtestEx(trainRows, trainPreds, "cc", { thrUp: tu, thrDn: td, costBps, direction: d });
+      if (!bestTr || tr.sharpe > bestTr.trSharpe) bestTr = { d, tu, td, trSharpe: tr.sharpe };
+    }
+
+    // ---- OOS backtest MIRAGE ----
+    const testRows = [], testPreds = [];
+    for (let t = splitIdx; t < T - 1; t++) if (rowsAll[t]) { testRows.push(rowsAll[t]); testPreds.push(adjPreds[t]); }
+    const mir = backtestEx(testRows, testPreds, "cc", { thrUp: bestTr.tu, thrDn: bestTr.td, costBps, direction: bestTr.d });
+
+    // ---- Baseline for honest comparison: plain multi-regression on leader returns only, same train/test ----
+    const Xbase = new Array(T).fill(null);
+    for (let t = 130; t < T - 1; t++) Xbase[t] = [1, ...selected.map(id => leaderRet[id][t])];
+    const XbTr = [], yBTr = [];
+    for (let t = 130; t < splitIdx; t++) if (Xbase[t]) { XbTr.push(Xbase[t]); yBTr.push(y[t]); }
+    const baseFit = multiRegress(XbTr, yBTr);
+    const basePreds = new Array(T).fill(0);
+    if (baseFit) for (let t = 130; t < T - 1; t++) if (Xbase[t]) {
+      let p = 0; for (let i = 0; i < Xbase[t].length; i++) p += Xbase[t][i] * baseFit.beta[i]; basePreds[t] = p;
+    }
+    const trainBasePreds = [];
+    for (let t = 130; t < splitIdx; t++) if (Xbase[t]) trainBasePreds.push(basePreds[t]);
+    let baseTr = null;
+    for (const d of ["both", "long", "short"]) {
+      const tune = scanThresholds(trainRows, trainBasePreds, "cc", costBps, d);
+      const tu = tune.bestAsym ? tune.bestAsym.up : 0;
+      const td = tune.bestAsym ? tune.bestAsym.dn : 0;
+      const tr = backtestEx(trainRows, trainBasePreds, "cc", { thrUp: tu, thrDn: td, costBps, direction: d });
+      if (!baseTr || tr.sharpe > baseTr.trSharpe) baseTr = { d, tu, td, trSharpe: tr.sharpe };
+    }
+    const testBasePreds = [];
+    for (let t = splitIdx; t < T - 1; t++) if (Xbase[t]) testBasePreds.push(basePreds[t]);
+    const base = backtestEx(testRows, testBasePreds, "cc", { thrUp: baseTr.tu, thrDn: baseTr.td, costBps, direction: baseTr.d });
+
+    // ---- K* counts ----
     const kCounts = [0, 0, 0, 0];
     for (let t = 60; t < T; t++) kCounts[K[t]]++;
 
-    // Phase coherence heatmap (top-K × 8 scales)
+    // ---- Phase coherence heatmap ----
     const heatCells = selected.map(id => {
-      const { coh } = leaderScores[id];
-      return `<tr><td>${nameOf(id)}</td>${coh.map(c => {
+      const { coh, lag } = leaderScores[id];
+      return `<tr><td>${nameOf(id)}</td>${coh.map((c, si) => {
         const v = Math.max(0, (c - 0.5) * 2);
         const hue = 140;
-        return `<td style="background:hsl(${hue},70%,${50 - v * 30}%);color:${v > 0.4 ? "#fff" : "#aaa"};text-align:center;font-size:.65rem">${(c * 100).toFixed(0)}</td>`;
+        const bg = `hsl(${hue},70%,${50 - v * 30}%)`;
+        const fg = v > 0.4 ? "#fff" : "#aaa";
+        const lagTxt = lag[si] !== 0 ? `<sup style="font-size:.55rem">${lag[si] > 0 ? "+" : ""}${lag[si]}</sup>` : "";
+        return `<td style="background:${bg};color:${fg};text-align:center;font-size:.65rem">${(c * 100).toFixed(0)}${lagTxt}</td>`;
       }).join("")}</tr>`;
     }).join("");
 
+    // ---- Per-K sample counts for regression fit ----
+    const kFitRows = [0, 1, 2, 3].map(k => `
+      <tr><td>K=${k} ${["News","Neutral","Fade","Chaos"][k]}</td>
+          <td>${perKN[k]}</td>
+          <td>${perKBeta[k] ? "✓ fit" : "— pooled"}</td></tr>`).join("");
+
+    const lift = mir.sharpe - base.sharpe;
+    const liftPct = base.sharpe !== 0 ? ((mir.sharpe - base.sharpe) / Math.abs(base.sharpe)) * 100 : 0;
+
     out.innerHTML = `
       <div class="signal">
-        <div class="h">MIRAGE · ${F.name} · ${MODE_LABEL[mode]} · top-${topK} coherent leaders</div>
+        <div class="h">MIRAGE v2 · ${F.name} · ${MODE_LABEL[mode]} · OOS ${T - splitIdx} days · ${bestTr.d} / baseline ${baseTr.d}</div>
         <div class="b">
-          OOS-like full-window backtest: Sharpe <span class="em ${cls(sharpe)}">${fmtNum(sharpe, 2)}</span> ·
-          hit <span class="em">${fmtPct(trades ? hits / trades : 0, 1)}</span> ·
-          equity <span class="em ${equity[equity.length - 1].v >= 1 ? "up" : "dn"}">${fmtNum(equity[equity.length - 1].v, 2)}×</span> ·
-          N=${trades} · maxDD ${fmtPct(maxDD, 1)}
+          MIRAGE OOS: Sharpe <span class="em ${cls(mir.sharpe)}">${fmtNum(mir.sharpe, 2)}</span>,
+          hit <span class="em">${fmtPct(mir.hitRate, 1)}</span>,
+          equity <span class="em ${mir.finalV >= 1 ? "up" : "dn"}">${fmtNum(mir.finalV, 2)}×</span>,
+          N=${mir.trades}, maxDD ${fmtPct(mir.maxDD, 1)}
+          <br>Baseline (plain leader OLS) OOS: Sharpe ${fmtNum(base.sharpe, 2)}, hit ${fmtPct(base.hitRate, 1)}, equity ${fmtNum(base.finalV, 2)}×.
+          <strong>Lift: <span class="${lift > 0 ? "pos" : "neg"}">${lift > 0 ? "+" : ""}${fmtNum(lift, 2)} Sharpe (${liftPct.toFixed(0)}%)</span></strong>
         </div>
       </div>
 
-      <div class="chart"><h3>Pillar 2 · Phase Coherence Heatmap (top-${topK} × 8 scales)</h3>
+      <div class="chart"><h3>Pillar 2 · Phase Coherence × Scale (top-${topK} causal leaders, best-lag shown as superscript)</h3>
         <div style="overflow-x:auto"><table style="width:100%;font-size:.7rem;border-collapse:collapse">
           <thead><tr><th style="text-align:left">Leader</th>${MIRAGE_SCALES.map(s => `<th style="text-align:center">${s}d</th>`).join("")}</tr></thead>
           <tbody>${heatCells}</tbody>
         </table></div>
-        <div style="font-size:.7rem;color:var(--muted);margin-top:6px">แต่ละช่อง = % agreement ของ phase ที่ scale นั้น (50% = สุ่ม, 100% = sync สมบูรณ์)</div>
       </div>
 
-      <div class="chart"><h3>Pillar 4 · K* (Anticipation Depth) distribution</h3>
+      <div class="chart"><h3>Pillar 4 · K* regime distribution + per-regime fit counts</h3>
         <div class="stats">
           <div class="stat"><div class="l">K=0 News</div><div class="v">${kCounts[0]}</div><div class="s">${fmtPct(kCounts[0] / T, 1)}</div></div>
           <div class="stat"><div class="l">K=1 Neutral</div><div class="v">${kCounts[1]}</div><div class="s">${fmtPct(kCounts[1] / T, 1)}</div></div>
           <div class="stat"><div class="l">K=2 Fade</div><div class="v">${kCounts[2]}</div><div class="s">${fmtPct(kCounts[2] / T, 1)}</div></div>
           <div class="stat"><div class="l">K=3 Chaos</div><div class="v">${kCounts[3]}</div><div class="s">${fmtPct(kCounts[3] / T, 1)}</div></div>
         </div>
-        <div style="font-size:.7rem;color:var(--muted);margin-top:6px">K* = ระดับ meta ของตลาด. MIRAGE เทรด LONG ที่ K=0, ชอร์ทที่ K=2, ลดขนาดที่ K=1, ไม่เทรดที่ K=3. K-transition boost 1.5× เมื่อเปลี่ยนระดับ.</div>
+        <div style="margin-top:8px"><table style="width:100%;font-size:.75rem">
+          <thead><tr><th style="text-align:left">Regime</th><th>Train samples</th><th>Fit status</th></tr></thead>
+          <tbody>${kFitRows}</tbody>
+        </table></div>
       </div>
 
-      <div class="chart"><h3>Pillars 5-7 · Equity curve (anti-reflexive with holographic memory)</h3>
-        ${svgLine(equity.slice(130), 360, 140, "#7ecbff")}
+      <div class="chart"><h3>OOS equity — MIRAGE ${bestTr.d}</h3>
+        ${svgLine(mir.equity, 360, 140, lift >= 0 ? "#4ade80" : "#f87171")}
       </div>
 
       <div class="stats">
-        <div class="stat"><div class="l">Sharpe</div><div class="v ${cls(sharpe)}">${fmtNum(sharpe, 2)}</div><div class="s">annualised</div></div>
-        <div class="stat"><div class="l">Hit rate</div><div class="v">${fmtPct(trades ? hits / trades : 0, 1)}</div><div class="s">N=${trades}</div></div>
-        <div class="stat"><div class="l">Final equity</div><div class="v ${equity[equity.length - 1].v >= 1 ? "pos" : "neg"}">${fmtNum(equity[equity.length - 1].v, 2)}×</div><div class="s">${fmtPct(equity[equity.length - 1].v - 1, 1)}</div></div>
-        <div class="stat"><div class="l">Max DD</div><div class="v neg">${fmtPct(maxDD, 1)}</div><div class="s">peak→trough</div></div>
-        <div class="stat"><div class="l">Avg trade</div><div class="v ${cls(avg)}">${fmtPct(avg, 3)}</div><div class="s">per trade</div></div>
-        <div class="stat"><div class="l">Top causal leaders</div><div class="v" style="font-size:.85rem">${selected.map(nameOf).join(" + ")}</div><div class="s">ordered by Σ coh × log(s)</div></div>
+        <div class="stat"><div class="l">MIRAGE Sharpe</div><div class="v ${cls(mir.sharpe)}">${fmtNum(mir.sharpe, 2)}</div><div class="s">${bestTr.d}</div></div>
+        <div class="stat"><div class="l">Baseline Sharpe</div><div class="v ${cls(base.sharpe)}">${fmtNum(base.sharpe, 2)}</div><div class="s">${baseTr.d}</div></div>
+        <div class="stat"><div class="l">MIRAGE hit</div><div class="v">${fmtPct(mir.hitRate, 1)}</div><div class="s">N=${mir.trades}</div></div>
+        <div class="stat"><div class="l">Baseline hit</div><div class="v">${fmtPct(base.hitRate, 1)}</div><div class="s">N=${base.trades}</div></div>
+        <div class="stat"><div class="l">MIRAGE equity</div><div class="v ${mir.finalV >= 1 ? "pos" : "neg"}">${fmtNum(mir.finalV, 2)}×</div><div class="s">${fmtPct(mir.finalV - 1, 1)}</div></div>
+        <div class="stat"><div class="l">Baseline equity</div><div class="v ${base.finalV >= 1 ? "pos" : "neg"}">${fmtNum(base.finalV, 2)}×</div><div class="s">${fmtPct(base.finalV - 1, 1)}</div></div>
+        <div class="stat"><div class="l">MIRAGE max DD</div><div class="v neg">${fmtPct(mir.maxDD, 1)}</div><div class="s">peak→trough</div></div>
+        <div class="stat"><div class="l">Baseline max DD</div><div class="v neg">${fmtPct(base.maxDD, 1)}</div><div class="s">peak→trough</div></div>
       </div>
 
       <div class="hint">
-        <strong>วิธีอ่าน:</strong> MIRAGE ไม่ predict price, predict <strong>reflexivity state K*</strong>
-        แล้ว map เป็น direction: K=0→trend-follow, K=2→fade, transitions ได้ขนาดใหญ่กว่า.
-        Phase coherence tensor บอกว่า leader ไหน sync ที่ scale ใด, memory kernel ใช้ dominant scale
-        เป็น peak ของ resonance กรองสัญญาณเก่าให้ relevant กับ horizon ปัจจุบัน.
+        <strong>v2 อธิบาย:</strong> MIRAGE v2 ใช้ ridge regression บน features
+        [leader returns × ${topK} + dominant-scale pressure + memory + tribe amplitudes]
+        แล้วฟิต <strong>แยกต่อ K regime</strong> บน train only. ที่ inference ใช้ β ของ regime ปัจจุบัน.
+        ถ้า regime ไม่มี train data พอ fall back เป็น pooled β. Prediction ผ่าน
+        <strong>ARD scaling</strong> (K=0 1.0×, K=1 0.5×, K=2 1.0×, K=3 0×, transition +30%)
+        ก่อน tune threshold + direction บน train เท่านั้น.
+        <br>Lift ที่แสดงคือ Sharpe ต่างระหว่าง MIRAGE กับ plain OLS ที่เลือก leader ชุดเดียวกัน —
+        บอกว่าทั้งการ gating per regime + pressure/memory features ช่วยจริงไหม.
       </div>`;
   } catch (e) {
     out.innerHTML = `<div class="err">MIRAGE error: ${e.message}</div>`;
