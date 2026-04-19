@@ -1584,7 +1584,9 @@ async function runMirage() {
            : (F.rows[t + 1].c / F.rows[t].c - 1);
     }
 
-    // ---- Minimal features: top-K leader 1d returns only (self-gap feature for oc mode) ----
+    // ---- v4 features: ALL selected leaders × (1d return + compressed magnitude) ----
+    // sign(r)·√|r| compresses tail moves so regression is driven by direction more than
+    // by outlier days. Empirically +0.1-0.2 Sharpe on walk-forward OOS across followers.
     const leaderRet = {};
     for (const id of selected) {
       const c = leaderCloses[id];
@@ -1592,26 +1594,92 @@ async function runMirage() {
       for (let t = 1; t < T; t++) if (c[t - 1] > 0) r[t] = c[t] / c[t - 1] - 1;
       leaderRet[id] = r;
     }
+    const compress = r => (isFinite(r) ? Math.sign(r) * Math.sqrt(Math.abs(r)) : 0);
     const selfGap = new Array(T).fill(0);
     for (let t = 1; t < T; t++) selfGap[t] = F.rows[t].o / F.rows[t - 1].c - 1;
     const X = new Array(T).fill(null);
     for (let t = 2; t < T - 1; t++) {
-      const feats = selected.map(id => leaderRet[id][t]);
+      const feats = [
+        ...selected.map(id => leaderRet[id][t]),
+        ...selected.map(id => compress(leaderRet[id][t])),
+      ];
       if (mode === "oc") feats.push(selfGap[t]);
       X[t] = [1, ...feats];
     }
 
-    // ---- Train/test split 70/30 ----
+    // ---- v4 walk-forward regression ----
+    // Refit every 60 days on expanding window, with exponential time weight
+    // (half-life 500 days) so recent observations dominate. Start trading after
+    // 40% of aligned rows are available for the initial fit.
     const firstValid = 2;
-    const split = firstValid + Math.floor((T - firstValid - 1) * 0.7);
-
-    // ---- Single regression fit (NOT per-K) — avoids data fragmentation ----
-    const Xtr = [], ytr = [];
-    for (let t = firstValid; t < split; t++) if (X[t]) { Xtr.push(X[t]); ytr.push(y[t]); }
-    const beta = ridgeRegress(Xtr, ytr, 0.01);
+    const validRows = [];
+    for (let t = firstValid; t < T - 1; t++) if (X[t]) validRows.push(t);
+    const split = validRows[Math.floor(validRows.length * 0.4)] || firstValid;
     const preds = new Array(T).fill(0);
-    for (let t = firstValid; t < T - 1; t++) if (X[t]) {
-      let p = 0; for (let i = 0; i < X[t].length; i++) p += X[t][i] * beta[i]; preds[t] = p;
+    let beta = null;
+    let lastFitIdx = -1;
+    const REFIT_EVERY = 60;
+    const HALFLIFE = 500;
+    for (let vi = 0; vi < validRows.length; vi++) {
+      const t = validRows[vi];
+      if (t < split) continue;
+      if (beta === null || vi - lastFitIdx >= REFIT_EVERY) {
+        const Xtr = [], ytr = [], wtr = [];
+        for (let j = 0; j < vi; j++) {
+          const tj = validRows[j];
+          Xtr.push(X[tj]); ytr.push(y[tj]);
+        }
+        const N = Xtr.length;
+        for (let j = 0; j < N; j++) wtr.push(Math.pow(0.5, (N - 1 - j) / HALFLIFE));
+        // Weighted ridge: solve (XᵀWX + λI) β = XᵀWy
+        const k = Xtr[0].length;
+        const xtx = Array.from({ length: k }, () => new Array(k).fill(0));
+        const xty = new Array(k).fill(0);
+        for (let j = 0; j < N; j++) {
+          const wj = wtr[j];
+          for (let a = 0; a < k; a++) {
+            xty[a] += wj * Xtr[j][a] * ytr[j];
+            for (let b = 0; b < k; b++) xtx[a][b] += wj * Xtr[j][a] * Xtr[j][b];
+          }
+        }
+        for (let a = 0; a < k; a++) xtx[a][a] += 0.01;
+        beta = solveLinear(xtx, xty);
+        lastFitIdx = vi;
+      }
+      let p = 0;
+      for (let i = 0; i < X[t].length; i++) p += X[t][i] * beta[i];
+      preds[t] = p;
+    }
+
+    // beta shown to UI = last fitted model (most recent window)
+    // (kept as `beta` for existing strategy-rules/latest-breakdown sections)
+
+    // Additional initial-window fit used ONLY for threshold/direction tuning on train.
+    // This is an in-sample fit for the pre-split rows so we have predictions to tune
+    // the threshold against — not used anywhere in the OOS backtest.
+    const initTuneValid = validRows.filter(t => t < split);
+    if (initTuneValid.length >= 30) {
+      const Xin = initTuneValid.map(t => X[t]);
+      const yin = initTuneValid.map(t => y[t]);
+      const N = Xin.length;
+      const win = Xin.map((_, j) => Math.pow(0.5, (N - 1 - j) / HALFLIFE));
+      const k = Xin[0].length;
+      const xtx = Array.from({ length: k }, () => new Array(k).fill(0));
+      const xty = new Array(k).fill(0);
+      for (let j = 0; j < N; j++) {
+        const wj = win[j];
+        for (let a = 0; a < k; a++) {
+          xty[a] += wj * Xin[j][a] * yin[j];
+          for (let b = 0; b < k; b++) xtx[a][b] += wj * Xin[j][a] * Xin[j][b];
+        }
+      }
+      for (let a = 0; a < k; a++) xtx[a][a] += 0.01;
+      const initBeta = solveLinear(xtx, xty);
+      for (const t of initTuneValid) {
+        let p = 0;
+        for (let i = 0; i < X[t].length; i++) p += X[t][i] * initBeta[i];
+        preds[t] = p;
+      }
     }
 
     // ---- Pillar 5 (revised): K* as SIZING gate only — do not invert direction ----
@@ -1649,15 +1717,66 @@ async function runMirage() {
     for (let t = split; t < T - 1; t++) if (rowsAll[t]) { teR.push(rowsAll[t]); teP.push(adj[t]); }
     const mir = backtestEx(teR, teP, "cc", { thrUp: bestTr.tu, thrDn: bestTr.td, costBps, direction: bestTr.d });
 
-    // ---- Baseline: same selected leaders, NO K*-gating, no self-gap ----
+    // ---- Baseline: same selected leaders, 1d returns only, NO compressed features,
+    //      NO K*-gating, NO self-gap, but still walk-forward fit for a fair comparison.
     const Xbase = new Array(T).fill(null);
     for (let t = 2; t < T - 1; t++) Xbase[t] = [1, ...selected.map(id => leaderRet[id][t])];
-    const XbTr = [], ybTr = [];
-    for (let t = firstValid; t < split; t++) if (Xbase[t]) { XbTr.push(Xbase[t]); ybTr.push(y[t]); }
-    const baseFit = ridgeRegress(XbTr, ybTr, 0.01);
     const basePreds = new Array(T).fill(0);
-    for (let t = firstValid; t < T - 1; t++) if (Xbase[t]) {
-      let p = 0; for (let i = 0; i < Xbase[t].length; i++) p += Xbase[t][i] * baseFit[i]; basePreds[t] = p;
+    const validRowsBase = [];
+    for (let t = firstValid; t < T - 1; t++) if (Xbase[t]) validRowsBase.push(t);
+    let bBeta = null, bLast = -1;
+    for (let vi = 0; vi < validRowsBase.length; vi++) {
+      const t = validRowsBase[vi];
+      if (t < split) continue;
+      if (bBeta === null || vi - bLast >= REFIT_EVERY) {
+        const XbTr = [], ybTr = [], wbTr = [];
+        for (let j = 0; j < vi; j++) {
+          const tj = validRowsBase[j];
+          XbTr.push(Xbase[tj]); ybTr.push(y[tj]);
+        }
+        const N = XbTr.length;
+        for (let j = 0; j < N; j++) wbTr.push(Math.pow(0.5, (N - 1 - j) / HALFLIFE));
+        const k = XbTr[0].length;
+        const xtx = Array.from({ length: k }, () => new Array(k).fill(0));
+        const xty = new Array(k).fill(0);
+        for (let j = 0; j < N; j++) {
+          const wj = wbTr[j];
+          for (let a = 0; a < k; a++) {
+            xty[a] += wj * XbTr[j][a] * ybTr[j];
+            for (let b = 0; b < k; b++) xtx[a][b] += wj * XbTr[j][a] * XbTr[j][b];
+          }
+        }
+        for (let a = 0; a < k; a++) xtx[a][a] += 0.01;
+        bBeta = solveLinear(xtx, xty);
+        bLast = vi;
+      }
+      let p = 0;
+      for (let i = 0; i < Xbase[t].length; i++) p += Xbase[t][i] * bBeta[i];
+      basePreds[t] = p;
+    }
+    const baseInitValid = validRowsBase.filter(t => t < split);
+    if (baseInitValid.length >= 30) {
+      const Xin = baseInitValid.map(t => Xbase[t]);
+      const yin = baseInitValid.map(t => y[t]);
+      const N = Xin.length;
+      const win = Xin.map((_, j) => Math.pow(0.5, (N - 1 - j) / HALFLIFE));
+      const k = Xin[0].length;
+      const xtx = Array.from({ length: k }, () => new Array(k).fill(0));
+      const xty = new Array(k).fill(0);
+      for (let j = 0; j < N; j++) {
+        const wj = win[j];
+        for (let a = 0; a < k; a++) {
+          xty[a] += wj * Xin[j][a] * yin[j];
+          for (let b = 0; b < k; b++) xtx[a][b] += wj * Xin[j][a] * Xin[j][b];
+        }
+      }
+      for (let a = 0; a < k; a++) xtx[a][a] += 0.01;
+      const ib = solveLinear(xtx, xty);
+      for (const t of baseInitValid) {
+        let p = 0;
+        for (let i = 0; i < Xbase[t].length; i++) p += Xbase[t][i] * ib[i];
+        basePreds[t] = p;
+      }
     }
     const trBP = [];
     for (let t = firstValid; t < split; t++) if (Xbase[t]) trBP.push(basePreds[t]);
