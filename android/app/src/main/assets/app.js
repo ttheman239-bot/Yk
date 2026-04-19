@@ -1523,12 +1523,12 @@ function holographicMemory(pressures, tribeAmpAtT, t, maxLookback = 64) {
 // Pillar 7 — runMirage. Full backtest.
 async function runMirage() {
   const out = document.getElementById("mOut");
-  out.innerHTML = `<div class="loading">Running MIRAGE v2 pipeline (7 pillars, return-based regression)…</div>`;
+  out.innerHTML = `<div class="loading">Running MIRAGE v3 (minimal features + K*-gated sizing)…</div>`;
   const followerId = document.getElementById("mFollower").value;
   const mode = document.getElementById("mMode").value;
   const years = Math.max(2, parseFloat(document.getElementById("mYears").value) || 5);
   const costBps = Math.max(0, parseFloat(document.getElementById("mCost").value) || 5);
-  const topK = Math.max(2, Math.min(6, parseInt(document.getElementById("mTopK").value) || 3));
+  const topK = Math.max(2, Math.min(8, parseInt(document.getElementById("mTopK").value) || 3));
 
   try {
     const F = await loadSeries(followerId, years);
@@ -1540,7 +1540,7 @@ async function runMirage() {
     const returnsF = F.rows.map((r, i) => i === 0 ? 0 : r.c / F.rows[i - 1].c - 1);
     const T = F.rows.length;
 
-    // ---- Pillar 1: RED of follower + aligned leaders ----
+    // ---- Pillar 1: RED for follower + date-aligned leaders ----
     const pressF = redDecompose(closesF);
     const leaderPress = {};
     const leaderCloses = {};
@@ -1572,13 +1572,11 @@ async function runMirage() {
     const selected = ranked.slice(0, topK).map(([id]) => id);
     const nameOf = id => (manifest.symbols.find(s => s.id === id) || { name: id }).name;
 
-    // ---- Pillar 3: tribe amplitude spectrum ----
+    // ---- Pillar 3+4: tribe amp + K* (used for SIZING only, not for splitting fits) ----
     const tribeF = tribeAmplitude(pressF, 60);
+    const { K } = estimateKStar(tribeF, returnsF, 30);
 
-    // ---- Pillar 4: K* per day ----
-    const { K, invariants } = estimateKStar(tribeF, returnsF, 30);
-
-    // ---- Build target vector y (next-day follower return under chosen mode) ----
+    // ---- Target y: next-day follower return under chosen mode ----
     const y = new Array(T).fill(0);
     for (let t = 0; t < T - 1; t++) {
       y[t] = mode === "oc" ? (F.rows[t + 1].c / F.rows[t + 1].o - 1)
@@ -1586,8 +1584,7 @@ async function runMirage() {
            : (F.rows[t + 1].c / F.rows[t].c - 1);
     }
 
-    // ---- Build feature matrix X ----
-    // [1, leader_ret_1d × topK, follower_pressure_dominant, memory_dominant, tribe_low_vol, tribe_hi_vol]
+    // ---- Minimal features: top-K leader 1d returns only (self-gap feature for oc mode) ----
     const leaderRet = {};
     for (const id of selected) {
       const c = leaderCloses[id];
@@ -1595,168 +1592,133 @@ async function runMirage() {
       for (let t = 1; t < T; t++) if (c[t - 1] > 0) r[t] = c[t] / c[t - 1] - 1;
       leaderRet[id] = r;
     }
+    const selfGap = new Array(T).fill(0);
+    for (let t = 1; t < T; t++) selfGap[t] = F.rows[t].o / F.rows[t - 1].c - 1;
     const X = new Array(T).fill(null);
-    const dominantScales = new Array(T).fill(0);
-    const memories = new Array(T).fill(null);
-    for (let t = 130; t < T - 1; t++) {
-      const tribeAtT = tribeF.map(a => a[t]);
-      const { memory, dominantScale: dom } = holographicMemory(pressF, tribeAtT, t);
-      dominantScales[t] = dom;
-      memories[t] = memory;
-      const leaderFeats = selected.map(id => leaderRet[id][t]);
-      const pressDom = pressF[dom][t];
-      const memDom = memory[dom];
-      const tribeLow = tribeF[1][t] + tribeF[2][t];
-      const tribeHi = tribeF[5][t] + tribeF[6][t];
-      X[t] = [1, ...leaderFeats, pressDom, memDom, tribeLow, tribeHi];
+    for (let t = 2; t < T - 1; t++) {
+      const feats = selected.map(id => leaderRet[id][t]);
+      if (mode === "oc") feats.push(selfGap[t]);
+      X[t] = [1, ...feats];
     }
 
-    // ---- Train/test split (70/30), fit ridge PER K-regime on train only ----
-    const splitIdx = 130 + Math.floor((T - 131) * 0.7);
-    const perKBeta = { 0: null, 1: null, 2: null, 3: null };
-    const perKN = { 0: 0, 1: 0, 2: 0, 3: 0 };
-    for (let k = 0; k < 4; k++) {
-      const Xk = [], yk = [];
-      for (let t = 130; t < splitIdx; t++) if (X[t] && K[t] === k) { Xk.push(X[t]); yk.push(y[t]); }
-      perKN[k] = Xk.length;
-      if (Xk.length >= 30) perKBeta[k] = ridgeRegress(Xk, yk, 0.05);
-    }
-    // Fallback: if a regime has no train samples, use union-fit β as pooled model
-    let pooledBeta = null;
-    {
-      const Xk = [], yk = [];
-      for (let t = 130; t < splitIdx; t++) if (X[t]) { Xk.push(X[t]); yk.push(y[t]); }
-      if (Xk.length >= 30) pooledBeta = ridgeRegress(Xk, yk, 0.05);
-    }
+    // ---- Train/test split 70/30 ----
+    const firstValid = 2;
+    const split = firstValid + Math.floor((T - firstValid - 1) * 0.7);
 
-    // ---- Predict on full window (use each day's K's model) ----
+    // ---- Single regression fit (NOT per-K) — avoids data fragmentation ----
+    const Xtr = [], ytr = [];
+    for (let t = firstValid; t < split; t++) if (X[t]) { Xtr.push(X[t]); ytr.push(y[t]); }
+    const beta = ridgeRegress(Xtr, ytr, 0.01);
     const preds = new Array(T).fill(0);
-    for (let t = 130; t < T - 1; t++) {
-      if (!X[t]) continue;
-      const beta = perKBeta[K[t]] || pooledBeta;
-      if (!beta) continue;
-      let p = 0;
-      for (let i = 0; i < X[t].length; i++) p += X[t][i] * beta[i];
-      preds[t] = p;
+    for (let t = firstValid; t < T - 1; t++) if (X[t]) {
+      let p = 0; for (let i = 0; i < X[t].length; i++) p += X[t][i] * beta[i]; preds[t] = p;
     }
 
-    // ---- Pillar 5: ARD scaling (K-regime × transition boost) applied to prediction ----
-    const adjPreds = new Array(T).fill(0);
-    for (let t = 130; t < T - 1; t++) {
-      let m = 0;
-      switch (K[t]) {
-        case 0: m = 1.0; break;
-        case 1: m = 0.5; break;
-        case 2: m = 1.0; break;
-        case 3: m = 0.0; break;
-      }
-      if (t > 130 && K[t] !== K[t - 1] && K[t] !== 3) m *= 1.3;
-      adjPreds[t] = m * preds[t];
+    // ---- Pillar 5 (revised): K* as SIZING gate only — do not invert direction ----
+    // K=0 1.0× (fresh news, full conviction)
+    // K=1 0.5× (crowded, reduce exposure)
+    // K=2 0.8× (anti-reflexive hint, still trust fit)
+    // K=3 0.0× (chaos, sit out)
+    // Transition: +20% boost (new regime = biggest moves)
+    const adj = new Array(T).fill(0);
+    const sizeFactor = new Array(T).fill(1);
+    for (let t = firstValid; t < T - 1; t++) {
+      let m = 1;
+      switch (K[t]) { case 0: m = 1.0; break; case 1: m = 0.5; break; case 2: m = 0.8; break; case 3: m = 0; break; }
+      if (t > firstValid && K[t] !== K[t - 1] && K[t] !== 3) m *= 1.2;
+      sizeFactor[t] = m;
+      adj[t] = m * preds[t];
     }
 
-    // ---- Tune threshold + direction on TRAIN only (no look-ahead) ----
+    // ---- Tune threshold + direction on TRAIN only ----
     const rowsAll = new Array(T).fill(null);
-    for (let t = 130; t < T - 1; t++) rowsAll[t] = { dF: F.rows[t + 1].d, rF_cc: y[t], rF_oc: y[t], rF_co: y[t] };
-    const trainRows = [], trainPreds = [];
-    for (let t = 130; t < splitIdx; t++) if (rowsAll[t]) { trainRows.push(rowsAll[t]); trainPreds.push(adjPreds[t]); }
+    for (let t = firstValid; t < T - 1; t++) rowsAll[t] = { dF: F.rows[t + 1].d, rF_cc: y[t], rF_oc: y[t], rF_co: y[t] };
+    const trR = [], trP = [];
+    for (let t = firstValid; t < split; t++) if (rowsAll[t]) { trR.push(rowsAll[t]); trP.push(adj[t]); }
     let bestTr = null;
     for (const d of ["both", "long", "short"]) {
-      const tune = scanThresholds(trainRows, trainPreds, "cc", costBps, d);
+      const tune = scanThresholds(trR, trP, "cc", costBps, d);
       const tu = tune.bestAsym ? tune.bestAsym.up : 0;
       const td = tune.bestAsym ? tune.bestAsym.dn : 0;
-      const tr = backtestEx(trainRows, trainPreds, "cc", { thrUp: tu, thrDn: td, costBps, direction: d });
-      if (!bestTr || tr.sharpe > bestTr.trSharpe) bestTr = { d, tu, td, trSharpe: tr.sharpe };
+      const trBt = backtestEx(trR, trP, "cc", { thrUp: tu, thrDn: td, costBps, direction: d });
+      if (!bestTr || trBt.sharpe > bestTr.tr) bestTr = { d, tu, td, tr: trBt.sharpe };
     }
 
-    // ---- OOS backtest MIRAGE ----
-    const testRows = [], testPreds = [];
-    for (let t = splitIdx; t < T - 1; t++) if (rowsAll[t]) { testRows.push(rowsAll[t]); testPreds.push(adjPreds[t]); }
-    const mir = backtestEx(testRows, testPreds, "cc", { thrUp: bestTr.tu, thrDn: bestTr.td, costBps, direction: bestTr.d });
+    // ---- OOS MIRAGE ----
+    const teR = [], teP = [];
+    for (let t = split; t < T - 1; t++) if (rowsAll[t]) { teR.push(rowsAll[t]); teP.push(adj[t]); }
+    const mir = backtestEx(teR, teP, "cc", { thrUp: bestTr.tu, thrDn: bestTr.td, costBps, direction: bestTr.d });
 
-    // ---- Baseline for honest comparison: plain multi-regression on leader returns only, same train/test ----
+    // ---- Baseline: same selected leaders, NO K*-gating, no self-gap ----
     const Xbase = new Array(T).fill(null);
-    for (let t = 130; t < T - 1; t++) Xbase[t] = [1, ...selected.map(id => leaderRet[id][t])];
-    const XbTr = [], yBTr = [];
-    for (let t = 130; t < splitIdx; t++) if (Xbase[t]) { XbTr.push(Xbase[t]); yBTr.push(y[t]); }
-    const baseFit = multiRegress(XbTr, yBTr);
+    for (let t = 2; t < T - 1; t++) Xbase[t] = [1, ...selected.map(id => leaderRet[id][t])];
+    const XbTr = [], ybTr = [];
+    for (let t = firstValid; t < split; t++) if (Xbase[t]) { XbTr.push(Xbase[t]); ybTr.push(y[t]); }
+    const baseFit = ridgeRegress(XbTr, ybTr, 0.01);
     const basePreds = new Array(T).fill(0);
-    if (baseFit) for (let t = 130; t < T - 1; t++) if (Xbase[t]) {
-      let p = 0; for (let i = 0; i < Xbase[t].length; i++) p += Xbase[t][i] * baseFit.beta[i]; basePreds[t] = p;
+    for (let t = firstValid; t < T - 1; t++) if (Xbase[t]) {
+      let p = 0; for (let i = 0; i < Xbase[t].length; i++) p += Xbase[t][i] * baseFit[i]; basePreds[t] = p;
     }
-    const trainBasePreds = [];
-    for (let t = 130; t < splitIdx; t++) if (Xbase[t]) trainBasePreds.push(basePreds[t]);
+    const trBP = [];
+    for (let t = firstValid; t < split; t++) if (Xbase[t]) trBP.push(basePreds[t]);
     let baseTr = null;
     for (const d of ["both", "long", "short"]) {
-      const tune = scanThresholds(trainRows, trainBasePreds, "cc", costBps, d);
+      const tune = scanThresholds(trR, trBP, "cc", costBps, d);
       const tu = tune.bestAsym ? tune.bestAsym.up : 0;
       const td = tune.bestAsym ? tune.bestAsym.dn : 0;
-      const tr = backtestEx(trainRows, trainBasePreds, "cc", { thrUp: tu, thrDn: td, costBps, direction: d });
-      if (!baseTr || tr.sharpe > baseTr.trSharpe) baseTr = { d, tu, td, trSharpe: tr.sharpe };
+      const trBt = backtestEx(trR, trBP, "cc", { thrUp: tu, thrDn: td, costBps, direction: d });
+      if (!baseTr || trBt.sharpe > baseTr.tr) baseTr = { d, tu, td, tr: trBt.sharpe };
     }
-    const testBasePreds = [];
-    for (let t = splitIdx; t < T - 1; t++) if (Xbase[t]) testBasePreds.push(basePreds[t]);
-    const base = backtestEx(testRows, testBasePreds, "cc", { thrUp: baseTr.tu, thrDn: baseTr.td, costBps, direction: baseTr.d });
+    const teBP = [];
+    for (let t = split; t < T - 1; t++) if (Xbase[t]) teBP.push(basePreds[t]);
+    const base = backtestEx(teR, teBP, "cc", { thrUp: baseTr.tu, thrDn: baseTr.td, costBps, direction: baseTr.d });
 
     // ---- K* counts ----
     const kCounts = [0, 0, 0, 0];
-    for (let t = 60; t < T; t++) kCounts[K[t]]++;
+    for (let t = firstValid; t < T - 1; t++) kCounts[K[t]]++;
 
     // ---- Phase coherence heatmap ----
     const heatCells = selected.map(id => {
       const { coh, lag } = leaderScores[id];
       return `<tr><td>${nameOf(id)}</td>${coh.map((c, si) => {
         const v = Math.max(0, (c - 0.5) * 2);
-        const hue = 140;
-        const bg = `hsl(${hue},70%,${50 - v * 30}%)`;
+        const bg = `hsl(140,70%,${50 - v * 30}%)`;
         const fg = v > 0.4 ? "#fff" : "#aaa";
         const lagTxt = lag[si] !== 0 ? `<sup style="font-size:.55rem">${lag[si] > 0 ? "+" : ""}${lag[si]}</sup>` : "";
         return `<td style="background:${bg};color:${fg};text-align:center;font-size:.65rem">${(c * 100).toFixed(0)}${lagTxt}</td>`;
       }).join("")}</tr>`;
     }).join("");
 
-    // ---- Per-K sample counts for regression fit ----
-    const kFitRows = [0, 1, 2, 3].map(k => `
-      <tr><td>K=${k} ${["News","Neutral","Fade","Chaos"][k]}</td>
-          <td>${perKN[k]}</td>
-          <td>${perKBeta[k] ? "✓ fit" : "— pooled"}</td></tr>`).join("");
-
     const lift = mir.sharpe - base.sharpe;
     const liftPct = base.sharpe !== 0 ? ((mir.sharpe - base.sharpe) / Math.abs(base.sharpe)) * 100 : 0;
 
     out.innerHTML = `
       <div class="signal">
-        <div class="h">MIRAGE v2 · ${F.name} · ${MODE_LABEL[mode]} · OOS ${T - splitIdx} days · ${bestTr.d} / baseline ${baseTr.d}</div>
+        <div class="h">MIRAGE v3 · ${F.name} · ${MODE_LABEL[mode]} · OOS ${T - split} days · direction ${bestTr.d}</div>
         <div class="b">
           MIRAGE OOS: Sharpe <span class="em ${cls(mir.sharpe)}">${fmtNum(mir.sharpe, 2)}</span>,
           hit <span class="em">${fmtPct(mir.hitRate, 1)}</span>,
           equity <span class="em ${mir.finalV >= 1 ? "up" : "dn"}">${fmtNum(mir.finalV, 2)}×</span>,
           N=${mir.trades}, maxDD ${fmtPct(mir.maxDD, 1)}
-          <br>Baseline (plain leader OLS) OOS: Sharpe ${fmtNum(base.sharpe, 2)}, hit ${fmtPct(base.hitRate, 1)}, equity ${fmtNum(base.finalV, 2)}×.
-          <strong>Lift: <span class="${lift > 0 ? "pos" : "neg"}">${lift > 0 ? "+" : ""}${fmtNum(lift, 2)} Sharpe (${liftPct.toFixed(0)}%)</span></strong>
+          <br>Baseline OOS: Sharpe ${fmtNum(base.sharpe, 2)}, hit ${fmtPct(base.hitRate, 1)}, equity ${fmtNum(base.finalV, 2)}×, N=${base.trades}.
+          <strong>Lift: <span class="${lift > 0 ? "pos" : "neg"}">${lift >= 0 ? "+" : ""}${fmtNum(lift, 2)} Sharpe (${liftPct.toFixed(0)}%)</span></strong>
         </div>
       </div>
 
-      <div class="chart"><h3>Pillar 2 · Phase Coherence × Scale (top-${topK} causal leaders, best-lag shown as superscript)</h3>
+      <div class="chart"><h3>Pillar 2 · Phase Coherence Heatmap (top-${topK}, best-lag as superscript)</h3>
         <div style="overflow-x:auto"><table style="width:100%;font-size:.7rem;border-collapse:collapse">
           <thead><tr><th style="text-align:left">Leader</th>${MIRAGE_SCALES.map(s => `<th style="text-align:center">${s}d</th>`).join("")}</tr></thead>
           <tbody>${heatCells}</tbody>
         </table></div>
       </div>
 
-      <div class="chart"><h3>Pillar 4 · K* regime distribution + per-regime fit counts</h3>
+      <div class="chart"><h3>Pillar 4 · K* regime distribution (used for SIZING only)</h3>
         <div class="stats">
-          <div class="stat"><div class="l">K=0 News</div><div class="v">${kCounts[0]}</div><div class="s">${fmtPct(kCounts[0] / T, 1)}</div></div>
-          <div class="stat"><div class="l">K=1 Neutral</div><div class="v">${kCounts[1]}</div><div class="s">${fmtPct(kCounts[1] / T, 1)}</div></div>
-          <div class="stat"><div class="l">K=2 Fade</div><div class="v">${kCounts[2]}</div><div class="s">${fmtPct(kCounts[2] / T, 1)}</div></div>
-          <div class="stat"><div class="l">K=3 Chaos</div><div class="v">${kCounts[3]}</div><div class="s">${fmtPct(kCounts[3] / T, 1)}</div></div>
+          ${[0,1,2,3].map(k => `<div class="stat"><div class="l">K=${k} ${["News","Neutral","Fade","Chaos"][k]}</div><div class="v">${kCounts[k]}</div><div class="s">${fmtPct(kCounts[k] / T, 1)} · size×${[1.0,0.5,0.8,0.0][k]}</div></div>`).join("")}
         </div>
-        <div style="margin-top:8px"><table style="width:100%;font-size:.75rem">
-          <thead><tr><th style="text-align:left">Regime</th><th>Train samples</th><th>Fit status</th></tr></thead>
-          <tbody>${kFitRows}</tbody>
-        </table></div>
       </div>
 
-      <div class="chart"><h3>OOS equity — MIRAGE ${bestTr.d}</h3>
+      <div class="chart"><h3>OOS equity · MIRAGE v3</h3>
         ${svgLine(mir.equity, 360, 140, lift >= 0 ? "#4ade80" : "#f87171")}
       </div>
 
@@ -1772,14 +1734,11 @@ async function runMirage() {
       </div>
 
       <div class="hint">
-        <strong>v2 อธิบาย:</strong> MIRAGE v2 ใช้ ridge regression บน features
-        [leader returns × ${topK} + dominant-scale pressure + memory + tribe amplitudes]
-        แล้วฟิต <strong>แยกต่อ K regime</strong> บน train only. ที่ inference ใช้ β ของ regime ปัจจุบัน.
-        ถ้า regime ไม่มี train data พอ fall back เป็น pooled β. Prediction ผ่าน
-        <strong>ARD scaling</strong> (K=0 1.0×, K=1 0.5×, K=2 1.0×, K=3 0×, transition +30%)
-        ก่อน tune threshold + direction บน train เท่านั้น.
-        <br>Lift ที่แสดงคือ Sharpe ต่างระหว่าง MIRAGE กับ plain OLS ที่เลือก leader ชุดเดียวกัน —
-        บอกว่าทั้งการ gating per regime + pressure/memory features ช่วยจริงไหม.
+        <strong>v3 สูตรใหม่:</strong> ใช้ ridge regression บน features แค่ <code>[1, leader returns × ${topK}${mode === "oc" ? ", self-gap" : ""}]</code> —
+        ตัดเรื่อง pressure/memory/tribe ออกจาก feature set เพราะ v2 พิสูจน์แล้วว่าเพิ่ม noise และ overfit.
+        K* เปลี่ยนบทบาทจาก "split regression" เป็น "sizing gate" — คูณ position ด้วย 1.0/0.5/0.8/0.0 ตาม regime
+        โดย <strong>ไม่ invert direction</strong> (ให้ regression ทำหน้าที่หา sign เอง), transition boost 1.2×.
+        Baseline ใช้ top-K leaders เดียวกันแต่ไม่มี K*-gate ไม่มี self-gap — ดังนั้น lift ที่เห็นคือผลของ K*-gating ล้วนๆ.
       </div>`;
   } catch (e) {
     out.innerHTML = `<div class="err">MIRAGE error: ${e.message}</div>`;
