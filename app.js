@@ -1692,6 +1692,144 @@ async function runMirage() {
     const lift = mir.sharpe - base.sharpe;
     const liftPct = base.sharpe !== 0 ? ((mir.sharpe - base.sharpe) / Math.abs(base.sharpe)) * 100 : 0;
 
+    // ---- Build per-OOS-day trade record for detailed log ----
+    const START = 10000;
+    const perDay = [];
+    for (let t = split; t < T - 1; t++) {
+      if (!X[t]) continue;
+      const leaderFeats = selected.map(id => leaderRet[id][t]);
+      const extraFeat = mode === "oc" ? selfGap[t] : null;
+      const rawPred = preds[t];
+      const sizeK = sizeFactor[t];
+      const pred = adj[t];
+      const canLong = bestTr.d !== "short";
+      const canShort = bestTr.d !== "long";
+      let side = 0;
+      if (pred > 0 && pred >= bestTr.tu && canLong) side = 1;
+      else if (pred < 0 && -pred >= bestTr.td && canShort) side = -1;
+      const rF = y[t];
+      const gross = side !== 0 ? side * rF : 0;
+      const net = side !== 0 ? gross - 2 * (costBps / 1e4) : 0;
+      perDay.push({
+        dL: F.rows[t].d, dF: F.rows[t + 1].d,
+        kState: K[t], kPrev: t > 0 ? K[t - 1] : null, sizeK,
+        leaders: selected.map((id, i) => ({ id, name: nameOf(id), ret: leaderFeats[i], beta: beta[i + 1], contrib: beta[i + 1] * leaderFeats[i] })),
+        extraFeat, extraBeta: extraFeat != null ? beta[beta.length - 1] : null,
+        intercept: beta[0], rawPred, pred, side, rF, net,
+      });
+    }
+
+    // ---- Latest signal breakdown (last aligned day) ----
+    const latestIdx = perDay.length - 1;
+    const latest = latestIdx >= 0 ? perDay[latestIdx] : null;
+    let latestBreakdown = "";
+    if (latest) {
+      const contribRows = latest.leaders.map(c => `
+        <tr>
+          <td>${c.name}<div style="font-size:.65rem;color:var(--muted)">${c.id}</div></td>
+          <td class="${cls(c.ret)}">${fmtPct(c.ret, 2)}</td>
+          <td>${fmtNum(c.beta, 3)}</td>
+          <td class="${cls(c.contrib)}">${fmtPct(c.contrib, 3)}</td>
+        </tr>`).join("");
+      const selfGapRow = latest.extraFeat != null ? `
+        <tr>
+          <td>${F.name} self-gap</td>
+          <td class="${cls(latest.extraFeat)}">${fmtPct(latest.extraFeat, 2)}</td>
+          <td>${fmtNum(latest.extraBeta, 3)}</td>
+          <td class="${cls(latest.extraBeta * latest.extraFeat)}">${fmtPct(latest.extraBeta * latest.extraFeat, 3)}</td>
+        </tr>` : "";
+      const actionLabel = latest.side > 0 ? `<span class="em up">LONG ${F.name}</span>`
+        : latest.side < 0 ? `<span class="em dn">SHORT ${F.name}</span>`
+        : `<span class="em" style="color:var(--muted)">NO TRADE (K=${latest.kState} or threshold not met)</span>`;
+      latestBreakdown = `
+        <div class="chart"><h3>Latest signal breakdown · ${latest.dF} · K=${latest.kState} size×${latest.sizeK.toFixed(2)}</h3>
+          <div class="screener-table"><table>
+            <thead><tr><th>Leader</th><th>Return</th><th>β</th><th>Contribution</th></tr></thead>
+            <tbody>
+              ${contribRows}
+              ${selfGapRow}
+              <tr style="background:var(--panel-2);font-weight:700">
+                <td>Intercept α</td><td>—</td><td>—</td><td class="${cls(latest.intercept)}">${fmtPct(latest.intercept, 3)}</td>
+              </tr>
+              <tr style="background:var(--panel-2);font-weight:700">
+                <td>Raw prediction</td><td colspan="2">sum of contributions + α</td>
+                <td class="${cls(latest.rawPred)}">${fmtPct(latest.rawPred, 3)}</td>
+              </tr>
+              <tr style="background:var(--panel-2);font-weight:700">
+                <td>K-gated prediction</td><td colspan="2">raw × K-size (${latest.sizeK.toFixed(2)})</td>
+                <td class="${cls(latest.pred)}">${fmtPct(latest.pred, 3)}</td>
+              </tr>
+            </tbody>
+          </table></div>
+          <div style="font-size:.8rem;margin-top:8px;padding:8px;background:var(--panel-2);border-radius:6px">
+            Trigger: |pred| ${fmtPct(Math.abs(latest.pred), 2)} vs thresholds up≥${fmtPct(bestTr.tu, 2)} / dn≤−${fmtPct(bestTr.td, 2)} · dir ${bestTr.d} →
+            <strong>${actionLabel}</strong>
+          </div>
+        </div>`;
+    }
+
+    // ---- Strategy rules ----
+    const termsText = selected.map((id, i) => `<code>${fmtNum(beta[i + 1], 3)}×${nameOf(id)}</code>`).join(" + ")
+      + (mode === "oc" ? ` + <code>${fmtNum(beta[beta.length - 1], 3)}×self-gap</code>` : "");
+    const strategyBox = `
+      <div class="chart" style="border-left:3px solid var(--accent)"><h3>Strategy rules (MIRAGE v3 as executed)</h3>
+        <div style="font-size:.82rem;line-height:1.7;padding:4px 2px">
+          <strong>Prediction:</strong> ${termsText} ${beta[0] >= 0 ? "+" : "−"} <code>${fmtPct(Math.abs(beta[0]), 3)}</code> (intercept)<br>
+          <strong>K-gated size:</strong> pred × {K=0:1.0, K=1:0.5, K=2:0.8, K=3:0} · transition ×1.2<br>
+          <strong>Entry LONG:</strong> ${bestTr.d === "short" ? `<span style="color:var(--muted)">off (dir=SHORT only)</span>` : `K-gated pred ≥ +${fmtPct(bestTr.tu, 2)} → ซื้อ ${F.name} ที่ ${mode === "co" ? "open" : "close"}`}<br>
+          <strong>Entry SHORT:</strong> ${bestTr.d === "long" ? `<span style="color:var(--muted)">off (dir=LONG only)</span>` : `K-gated pred ≤ −${fmtPct(bestTr.td, 2)} → ชอร์ท ${F.name} ที่ ${mode === "co" ? "open" : "close"}`}<br>
+          <strong>Exit:</strong> ${mode === "co" ? "ปิดที่ open (gap-only)" : mode === "oc" ? "ปิดที่ close วันเดียวกัน (intraday)" : "ปิดที่ close วันถัดไป"}<br>
+          <strong>Cost:</strong> ${costBps} bps round-trip · <strong>Sizing:</strong> 1× equity (K-gated)<br>
+          <strong>Tuned on:</strong> 70% train (${split} days) · <strong>Tested on:</strong> OOS ${T - split} days
+        </div>
+      </div>`;
+
+    // ---- Realistic trade log with running equity $10,000 ----
+    const trades = perDay.filter(d => d.side !== 0);
+    let equity = START;
+    let wins = 0, losses = 0, sumWin = 0, sumLoss = 0, maxEq = START, maxDDd = 0;
+    for (const d of trades) {
+      equity *= (1 + d.net);
+      if (d.net > 0) { wins++; sumWin += d.net; } else if (d.net < 0) { losses++; sumLoss += d.net; }
+      if (equity > maxEq) maxEq = equity;
+      maxDDd = Math.min(maxDDd, (equity - maxEq) / maxEq);
+    }
+    const pf = sumLoss !== 0 ? Math.abs(sumWin / sumLoss) : 0;
+    let runEq = START;
+    const logRows = trades.slice(-30).map(d => {
+      runEq *= (1 + d.net);
+      const lm = d.leaders.map(l => `${l.name.split(" ")[0]} ${fmtPct(l.ret, 1)}`).join(" · ");
+      return `
+        <tr>
+          <td>${d.dF}</td>
+          <td class="${d.side > 0 ? "pos" : "neg"}">${d.side > 0 ? "LONG" : "SHORT"}</td>
+          <td>K=${d.kState}<div style="font-size:.65rem;color:var(--muted)">size×${d.sizeK.toFixed(2)}</div></td>
+          <td style="font-size:.65rem;color:var(--muted);white-space:normal">${lm}</td>
+          <td class="${cls(d.pred)}">${fmtPct(d.pred, 2)}</td>
+          <td class="${cls(d.rF)}">${fmtPct(d.rF, 2)}</td>
+          <td class="${cls(d.net)}">${fmtPct(d.net, 2)}</td>
+          <td>${runEq.toFixed(0)}</td>
+        </tr>`;
+    }).join("");
+    const realSimBox = `
+      <div class="chart"><h3>Realistic backtest · OOS · starting 10,000</h3>
+        <div class="stats" style="margin-bottom:10px">
+          <div class="stat"><div class="l">Final equity</div><div class="v ${equity >= START ? "pos" : "neg"}">${equity.toFixed(0)}</div><div class="s">${fmtPct(equity / START - 1, 1)}</div></div>
+          <div class="stat"><div class="l">Trades</div><div class="v">${trades.length}</div><div class="s">over ${T - split} OOS days</div></div>
+          <div class="stat"><div class="l">Win rate</div><div class="v">${fmtPct(trades.length ? wins / trades.length : 0, 1)}</div><div class="s">${wins}W / ${losses}L</div></div>
+          <div class="stat"><div class="l">Profit factor</div><div class="v ${pf >= 1 ? "pos" : "neg"}">${fmtNum(pf, 2)}</div><div class="s">Σwin / Σloss</div></div>
+          <div class="stat"><div class="l">Avg win</div><div class="v pos">${fmtPct(wins ? sumWin / wins : 0, 2)}</div><div class="s">per trade</div></div>
+          <div class="stat"><div class="l">Avg loss</div><div class="v neg">${fmtPct(losses ? sumLoss / losses : 0, 2)}</div><div class="s">per trade</div></div>
+          <div class="stat"><div class="l">Max drawdown</div><div class="v neg">${fmtPct(maxDDd, 1)}</div><div class="s">equity basis</div></div>
+          <div class="stat"><div class="l">OOS Sharpe</div><div class="v ${cls(mir.sharpe)}">${fmtNum(mir.sharpe, 2)}</div><div class="s">annualised</div></div>
+        </div>
+        <h3 style="margin-top:14px">Trade log · last ${Math.min(trades.length, 30)} OOS trades</h3>
+        <div class="screener-table"><table>
+          <thead><tr><th>Date</th><th>Dir</th><th>K</th><th>Leader moves</th><th>Pred</th><th>Actual</th><th>Net</th><th>Equity</th></tr></thead>
+          <tbody>${logRows || `<tr><td colspan="8" style="color:var(--muted)">No OOS trades — threshold too tight.</td></tr>`}</tbody>
+        </table></div>
+      </div>`;
+
     out.innerHTML = `
       <div class="signal">
         <div class="h">MIRAGE v3 · ${F.name} · ${MODE_LABEL[mode]} · OOS ${T - split} days · direction ${bestTr.d}</div>
@@ -1704,6 +1842,10 @@ async function runMirage() {
           <strong>Lift: <span class="${lift > 0 ? "pos" : "neg"}">${lift >= 0 ? "+" : ""}${fmtNum(lift, 2)} Sharpe (${liftPct.toFixed(0)}%)</span></strong>
         </div>
       </div>
+
+      ${strategyBox}
+      ${latestBreakdown}
+      ${realSimBox}
 
       <div class="chart"><h3>Pillar 2 · Phase Coherence Heatmap (top-${topK}, best-lag as superscript)</h3>
         <div style="overflow-x:auto"><table style="width:100%;font-size:.7rem;border-collapse:collapse">
